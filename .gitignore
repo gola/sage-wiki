@@ -10,4 +10,12 @@ sage/
 
 # Build
 /sage-wiki
+sage-wiki
+sage-wiki.exe
+sage-wiki-webui
+sage-wiki-webui.exe
 bin/
+internal/web/dist/
+
+# Images
+*.png

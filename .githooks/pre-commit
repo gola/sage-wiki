@@ -1,0 +1,75 @@
+#!/bin/bash
+# pre-commit hook: 检查敏感信息
+# 防止API密钥、个人信息等敏感数据提交到代码库
+
+set -e
+
+echo "🔍 正在检查敏感信息..."
+
+# 获取暂存的文件
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [ -z "$STAGED_FILES" ]; then
+    echo "✅ 没有暂存的文件需要检查"
+    exit 0
+fi
+
+# 敏感信息模式
+PATTERNS=(
+    # API密钥
+    'sk-[a-zA-Z0-9]{20,}'
+    'sk_live_[a-zA-Z0-9]{20,}'
+    'sk_test_[a-zA-Z0-9]{20,}'
+    'AIza[a-zA-Z0-9_-]{35}'
+    'ghp_[a-zA-Z0-9]{36}'
+    'gho_[a-zA-Z0-9]{36}'
+    'github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59}'
+    
+    # 通用密钥模式
+    'api[_-]?key[_-]*=["\x27]?[a-zA-Z0-9]{20,}'
+    'secret[_-]?key[_-]*=["\x27]?[a-zA-Z0-9]{20,}'
+    'access[_-]?token[_-]*=["\x27]?[a-zA-Z0-9]{20,}'
+    'private[_-]?key[_-]*=["\x27]?[a-zA-Z0-9]{20,}'
+    
+    # 个人邮箱
+    '[a-zA-Z0-9._%+-]+@(gmail|qq|163|126|outlook|hotmail|yahoo)\.(com|cn|com\.cn)'
+    
+    # 中国手机号
+    '1[3-9][0-9]{9}'
+    
+    # 中国身份证号
+    '[0-9]{17}[0-9Xx]'
+    
+    # 内网IP
+    '192\.168\.[0-9]{1,3}\.[0-9]{1,3}'
+    '10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'
+    '172\.(1[6-9]|2[0-9]|3[0-1])\.[0-9]{1,3}\.[0-9]{1,3}'
+)
+
+FOUND_SECRETS=0
+
+for FILE in $STAGED_FILES; do
+    if [ ! -f "$FILE" ]; then
+        continue
+    fi
+    
+    for PATTERN in "${PATTERNS[@]}"; do
+        MATCH=$(grep -nE "$PATTERN" "$FILE" 2>/dev/null || true)
+        if [ -n "$MATCH" ]; then
+            echo "❌ 发现敏感信息: $FILE"
+            echo "$MATCH"
+            FOUND_SECRETS=1
+        fi
+    done
+done
+
+if [ $FOUND_SECRETS -eq 1 ]; then
+    echo ""
+    echo "🚫 提交被阻止！发现敏感信息。"
+    echo "请移除敏感信息后重新提交。"
+    echo "如果这是误报，请使用 --no-verify 跳过检查。"
+    exit 1
+fi
+
+echo "✅ 未发现敏感信息，可以安全提交"
+exit 0
