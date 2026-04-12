@@ -27,6 +27,7 @@ type SummaryResult struct {
 }
 
 // Summarize processes sources through Pass 1, producing summaries.
+// visionClient is optional - if nil, vision processing will be skipped.
 func Summarize(
 	projectDir string,
 	outputDir string,
@@ -36,6 +37,9 @@ func Summarize(
 	maxTokens int,
 	maxParallel int,
 	userTZ *time.Location,
+	visionClient *llm.Client,
+	visionModel string,
+	visionEnabled bool,
 ) []SummaryResult {
 	if maxParallel <= 0 {
 		maxParallel = 4
@@ -55,7 +59,7 @@ func Summarize(
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			result := summarizeOne(projectDir, outputDir, info, client, model, maxTokens, userTZ)
+			result := summarizeOne(projectDir, outputDir, info, client, model, maxTokens, userTZ, visionClient, visionModel, visionEnabled)
 			results[idx] = result
 
 			n := int(done.Add(1))
@@ -79,6 +83,9 @@ func summarizeOne(
 	model string,
 	maxTokens int,
 	userTZ *time.Location,
+	visionClient *llm.Client,
+	visionModel string,
+	visionEnabled bool,
 ) SummaryResult {
 	result := SummaryResult{SourcePath: info.Path}
 
@@ -94,7 +101,23 @@ func summarizeOne(
 
 	// Handle image sources — use vision if available
 	if extract.IsImageSource(content) {
-		text, err := summarizeImage(projectDir, info, client, model, maxTokens)
+		// Check if vision is disabled
+		if !visionEnabled {
+			result.Error = fmt.Errorf("skipping image %s — vision processing is disabled", info.Path)
+			return result
+		}
+
+		// Use vision client if available, otherwise try main client
+		visionClientToUse := visionClient
+		visionModelToUse := visionModel
+
+		if visionClientToUse == nil {
+			// Fall back to main client if no separate vision client
+			visionClientToUse = client
+			visionModelToUse = model
+		}
+
+		text, err := summarizeImage(projectDir, info, visionClientToUse, visionModelToUse, maxTokens)
 		if err != nil {
 			result.Error = err
 			return result

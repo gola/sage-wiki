@@ -26,8 +26,8 @@ type Message struct {
 
 // CallOpts configures an LLM call.
 type CallOpts struct {
-	Model      string
-	MaxTokens  int
+	Model       string
+	MaxTokens   int
 	Temperature float64
 }
 
@@ -72,6 +72,15 @@ func NewClient(providerName string, apiKey string, baseURL string, rateLimit int
 		limiter:  newRateLimiter(rateLimit),
 		client:   http.Client{Timeout: 120 * time.Second},
 	}, nil
+}
+
+// NewVisionClient creates a new LLM client for vision processing using VisionAPIConfig.
+func NewVisionClient(providerName string, apiKey string, baseURL string, rateLimit int) (*Client, error) {
+	// Use openai-compatible as default for vision if not specified
+	if providerName == "" {
+		providerName = "openai-compatible"
+	}
+	return NewClient(providerName, apiKey, baseURL, rateLimit)
 }
 
 // ChatCompletion sends a chat completion request with retry on rate limits.

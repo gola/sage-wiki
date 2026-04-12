@@ -24,42 +24,42 @@ import (
 
 // CompileOpts configures a compilation run.
 type CompileOpts struct {
-	DryRun   bool
-	Fresh    bool              // ignore checkpoint
-	Batch    bool              // use batch API (async, 50% discount)
-	NoCache  bool              // disable prompt caching
-	Tracker  *llm.CostTracker  // optional cost tracker
+	DryRun  bool
+	Fresh   bool             // ignore checkpoint
+	Batch   bool             // use batch API (async, 50% discount)
+	NoCache bool             // disable prompt caching
+	Tracker *llm.CostTracker // optional cost tracker
 }
 
 // CompileResult summarizes what happened during compilation.
 type CompileResult struct {
-	Added              int
-	Modified           int
-	Removed            int
-	Summarized         int
-	ConceptsExtracted  int
-	ArticlesWritten    int
-	Errors             int
-	CostReport         *llm.CostReport // nil if no LLM calls were made
+	Added             int
+	Modified          int
+	Removed           int
+	Summarized        int
+	ConceptsExtracted int
+	ArticlesWritten   int
+	Errors            int
+	CostReport        *llm.CostReport // nil if no LLM calls were made
 }
 
 // CompileState tracks progress for checkpoint/resume (ADR-018).
 type CompileState struct {
-	CompileID string   `json:"compile_id"`
-	StartedAt string   `json:"started_at"`
-	Pass      int      `json:"pass"`
-	Completed []string `json:"completed"`
-	Pending   []string `json:"pending"`
+	CompileID string         `json:"compile_id"`
+	StartedAt string         `json:"started_at"`
+	Pass      int            `json:"pass"`
+	Completed []string       `json:"completed"`
+	Pending   []string       `json:"pending"`
 	Failed    []FailedSource `json:"failed,omitempty"`
 	Batch     *BatchState    `json:"batch,omitempty"` // non-nil when batch is in flight
 }
 
 // BatchState tracks an in-flight batch job for checkpoint/resume.
 type BatchState struct {
-	BatchID    string `json:"batch_id"`
-	Provider   string `json:"provider"`
-	Pass       string `json:"pass"`        // which compiler pass (summarize, extract)
-	ResultsRef string `json:"results_ref"` // Anthropic: results URL; OpenAI: output_file_id
+	BatchID     string `json:"batch_id"`
+	Provider    string `json:"provider"`
+	Pass        string `json:"pass"`        // which compiler pass (summarize, extract)
+	ResultsRef  string `json:"results_ref"` // Anthropic: results URL; OpenAI: output_file_id
 	SubmittedAt string `json:"submitted_at"`
 }
 
@@ -251,7 +251,40 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 		maxTokens = 2000
 	}
 
-	summaries := Summarize(projectDir, cfg.Output, toProcess, client, model, maxTokens, cfg.Compiler.MaxParallel, cfg.Compiler.UserTimeLocation())
+	// Determine vision configuration
+	var visionClient *llm.Client
+	visionModel := cfg.Models.Vision
+	visionEnabled := cfg.Compiler.VisionEnabled()
+
+	// Parse vision model reference (e.g., "gpt-4o-mini@vision_api" or "gpt-4o-mini@api" or "gpt-4o-mini")
+	visionModelName, visionAPIRef := config.ParseModelRef(visionModel, "api")
+
+	// Create vision client if enabled
+	if visionEnabled && visionModelName != "" {
+		if visionAPIRef == "vision_api" && cfg.VisionAPI != nil && (cfg.VisionAPI.Provider != "" || cfg.VisionAPI.BaseURL != "" || cfg.VisionAPI.APIKey != "") {
+			// Use separate vision API
+			vc, err := llm.NewVisionClient(
+				cfg.VisionAPI.Provider,
+				cfg.VisionAPI.APIKey,
+				cfg.VisionAPI.BaseURL,
+				cfg.API.RateLimit,
+			)
+			if err != nil {
+				log.Warn("failed to create vision client, falling back to main client", "error", err)
+			} else {
+				visionClient = vc
+				// Use model from vision_api config if not specified in the ref
+				if visionModel == cfg.Models.Vision && cfg.VisionAPI.Model != "" {
+					visionModelName = cfg.VisionAPI.Model
+				}
+			}
+		} else {
+			// Use main API (default) with the specified model
+			visionClient = client
+		}
+	}
+
+	summaries := Summarize(projectDir, cfg.Output, toProcess, client, model, maxTokens, cfg.Compiler.MaxParallel, cfg.Compiler.UserTimeLocation(), visionClient, visionModelName, visionEnabled)
 
 	for _, sr := range summaries {
 		if sr.Error != nil {

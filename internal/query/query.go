@@ -21,11 +21,11 @@ import (
 
 // QueryResult holds the answer and metadata.
 type QueryResult struct {
-	Question    string
-	Answer      string
-	Sources     []string // article paths used
-	Format      string   // markdown, terminal, marp
-	OutputPath  string   // if auto-filed
+	Question   string
+	Answer     string
+	Sources    []string // article paths used
+	Format     string   // markdown, terminal, marp
+	OutputPath string   // if auto-filed
 }
 
 // QueryOpts allows callers to pass shared resources.

@@ -15,21 +15,22 @@ var relationNameRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 // Config represents the sage-wiki project configuration.
 type Config struct {
-	Version     int          `yaml:"version"`
-	Project     string       `yaml:"project"`
-	Description string       `yaml:"description"`
-	Vault       *VaultConfig `yaml:"vault,omitempty"`
-	Sources     []Source     `yaml:"sources"`
-	Output      string       `yaml:"output"`
-	Ignore      []string     `yaml:"ignore,omitempty"`
-	API         APIConfig    `yaml:"api"`
-	Models      ModelsConfig `yaml:"models"`
-	Embed       *EmbedConfig `yaml:"embed,omitempty"`
-	Compiler    CompilerConfig `yaml:"compiler"`
-	Search      SearchConfig   `yaml:"search"`
-	Linting     LintingConfig  `yaml:"linting"`
-	Serve       ServeConfig    `yaml:"serve"`
-	Ontology    OntologyConfig `yaml:"ontology,omitempty"`
+	Version     int              `yaml:"version"`
+	Project     string           `yaml:"project"`
+	Description string           `yaml:"description"`
+	Vault       *VaultConfig     `yaml:"vault,omitempty"`
+	Sources     []Source         `yaml:"sources"`
+	Output      string           `yaml:"output"`
+	Ignore      []string         `yaml:"ignore,omitempty"`
+	API         APIConfig        `yaml:"api"`
+	VisionAPI   *VisionAPIConfig `yaml:"vision_api,omitempty"`
+	Models      ModelsConfig     `yaml:"models"`
+	Embed       *EmbedConfig     `yaml:"embed,omitempty"`
+	Compiler    CompilerConfig   `yaml:"compiler"`
+	Search      SearchConfig     `yaml:"search"`
+	Linting     LintingConfig    `yaml:"linting"`
+	Serve       ServeConfig      `yaml:"serve"`
+	Ontology    OntologyConfig   `yaml:"ontology,omitempty"`
 }
 
 type VaultConfig struct {
@@ -55,6 +56,7 @@ type ModelsConfig struct {
 	Write     string `yaml:"write"`
 	Lint      string `yaml:"lint"`
 	Query     string `yaml:"query"`
+	Vision    string `yaml:"vision,omitempty"`
 }
 
 type EmbedConfig struct {
@@ -66,19 +68,20 @@ type EmbedConfig struct {
 }
 
 type CompilerConfig struct {
-	MaxParallel      int     `yaml:"max_parallel"`
-	DebounceSeconds  int     `yaml:"debounce_seconds"`
-	SummaryMaxTokens int     `yaml:"summary_max_tokens"`
-	ArticleMaxTokens int     `yaml:"article_max_tokens"`
-	AutoCommit       bool    `yaml:"auto_commit"`
-	AutoLint         bool    `yaml:"auto_lint"`
-	Mode             string  `yaml:"mode,omitempty"`              // standard, batch, or auto
-	EstimateBefore   bool    `yaml:"estimate_before,omitempty"`   // prompt with cost estimate before compiling
-	PromptCache      *bool   `yaml:"prompt_cache,omitempty"`      // enable prompt caching (default: true)
-	BatchThreshold   int     `yaml:"batch_threshold,omitempty"`   // min sources to auto-select batch mode
-	TokenPriceOverride float64 `yaml:"token_price_per_million,omitempty"` // override price per 1M input tokens
-	Timezone         string   `yaml:"timezone,omitempty"`          // IANA timezone for user-facing timestamps (default: UTC)
-	ArticleFields    []string `yaml:"article_fields,omitempty"`    // custom frontmatter fields extracted from LLM response
+	MaxParallel        int      `yaml:"max_parallel"`
+	DebounceSeconds    int      `yaml:"debounce_seconds"`
+	SummaryMaxTokens   int      `yaml:"summary_max_tokens"`
+	ArticleMaxTokens   int      `yaml:"article_max_tokens"`
+	AutoCommit         bool     `yaml:"auto_commit"`
+	AutoLint           bool     `yaml:"auto_lint"`
+	Mode               string   `yaml:"mode,omitempty"`                    // standard, batch, or auto
+	EstimateBefore     bool     `yaml:"estimate_before,omitempty"`         // prompt with cost estimate before compiling
+	PromptCache        *bool    `yaml:"prompt_cache,omitempty"`            // enable prompt caching (default: true)
+	BatchThreshold     int      `yaml:"batch_threshold,omitempty"`         // min sources to auto-select batch mode
+	TokenPriceOverride float64  `yaml:"token_price_per_million,omitempty"` // override price per 1M input tokens
+	Timezone           string   `yaml:"timezone,omitempty"`                // IANA timezone for user-facing timestamps (default: UTC)
+	ArticleFields      []string `yaml:"article_fields,omitempty"`          // custom frontmatter fields extracted from LLM response
+	VisionEnabledPtr   *bool    `yaml:"vision_enabled,omitempty"`          // enable vision processing (default: true)
 
 	resolvedTZ *time.Location `yaml:"-"` // cached by Validate(); not serialized
 }
@@ -97,6 +100,14 @@ type LintingConfig struct {
 type ServeConfig struct {
 	Transport string `yaml:"transport"`
 	Port      int    `yaml:"port"`
+}
+
+// VisionAPIConfig configures a separate API for vision processing.
+type VisionAPIConfig struct {
+	Provider string `yaml:"provider,omitempty"`
+	APIKey   string `yaml:"api_key,omitempty"`
+	BaseURL  string `yaml:"base_url,omitempty"`
+	Model    string `yaml:"model,omitempty"`
 }
 
 // OntologyConfig configures ontology relation types.
@@ -146,6 +157,14 @@ func (c *CompilerConfig) PromptCacheEnabled() bool {
 		return true
 	}
 	return *c.PromptCache
+}
+
+// VisionEnabled returns whether vision processing is enabled (default: true).
+func (c *CompilerConfig) VisionEnabled() bool {
+	if c.VisionEnabledPtr == nil {
+		return true
+	}
+	return *c.VisionEnabledPtr
 }
 
 // UserTimeLocation returns the configured timezone for user-facing timestamps.
@@ -291,4 +310,17 @@ func expandEnvVars(s string) string {
 		i++
 	}
 	return result.String()
+}
+
+// ParseModelRef parses a model reference like "gpt-4o-mini@vision_api" or "gpt-4o-mini@api" or "gpt-4o-mini".
+// Returns the model name and the API reference ("api" or "vision_api").
+// If no @ is present, returns the model name and defaultAPI ("api").
+func ParseModelRef(ref string, defaultAPI string) (model string, apiRef string) {
+	if ref == "" {
+		return "", defaultAPI
+	}
+	if idx := strings.Index(ref, "@"); idx != -1 {
+		return ref[:idx], ref[idx+1:]
+	}
+	return ref, defaultAPI
 }

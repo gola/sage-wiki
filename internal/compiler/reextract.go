@@ -10,9 +10,9 @@ import (
 	"github.com/xoai/sage-wiki/internal/llm"
 	"github.com/xoai/sage-wiki/internal/log"
 	"github.com/xoai/sage-wiki/internal/manifest"
-	"github.com/xoai/sage-wiki/internal/prompts"
 	"github.com/xoai/sage-wiki/internal/memory"
 	"github.com/xoai/sage-wiki/internal/ontology"
+	"github.com/xoai/sage-wiki/internal/prompts"
 	"github.com/xoai/sage-wiki/internal/storage"
 	"github.com/xoai/sage-wiki/internal/vectors"
 )
