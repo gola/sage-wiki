@@ -82,6 +82,7 @@ type CompilerConfig struct {
 	Timezone           string   `yaml:"timezone,omitempty"`                // IANA timezone for user-facing timestamps (default: UTC)
 	ArticleFields      []string `yaml:"article_fields,omitempty"`          // custom frontmatter fields extracted from LLM response
 	VisionEnabledPtr   *bool    `yaml:"vision_enabled,omitempty"`          // enable vision processing (default: true)
+	SkipExts           []string `yaml:"skip_extensions,omitempty"`         // file extensions to skip (e.g., zip, key, exe)
 
 	resolvedTZ *time.Location `yaml:"-"` // cached by Validate(); not serialized
 }
@@ -165,6 +166,22 @@ func (c *CompilerConfig) VisionEnabled() bool {
 		return true
 	}
 	return *c.VisionEnabledPtr
+}
+
+// DefaultSkipExtensions returns the default list of file extensions to skip.
+func DefaultSkipExtensions() []string {
+	return []string{
+		"zip", "key", "exe", "dll", "tar", "gz", "7z", "rar",
+		"bin", "iso", "pkg", "deb", "rpm", "msi", "app",
+	}
+}
+
+// SkipExtensions returns the configured skip extensions, or defaults if not set.
+func (c *CompilerConfig) SkipExtensions() []string {
+	if len(c.SkipExts) > 0 {
+		return c.SkipExts
+	}
+	return DefaultSkipExtensions()
 }
 
 // UserTimeLocation returns the configured timezone for user-facing timestamps.

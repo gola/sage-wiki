@@ -14,6 +14,12 @@ import (
 	"github.com/xoai/sage-wiki/internal/manifest"
 )
 
+// defaultSkipExtensions contains the default list of file extensions to skip.
+var defaultSkipExtensions = []string{
+	"zip", "key", "exe", "dll", "tar", "gz", "7z", "rar",
+	"bin", "iso", "pkg", "deb", "rpm", "msi", "app",
+}
+
 // DiffResult holds the change sets from comparing sources against the manifest.
 type DiffResult struct {
 	Added    []SourceInfo
@@ -23,10 +29,10 @@ type DiffResult struct {
 
 // SourceInfo describes a source file.
 type SourceInfo struct {
-	Path     string
-	Hash     string
-	Type     string
-	Size     int64
+	Path string
+	Hash string
+	Type string
+	Size int64
 }
 
 // Diff scans source directories and compares against the manifest.
@@ -53,6 +59,12 @@ func Diff(projectDir string, cfg *config.Config, mf *manifest.Manifest) (*DiffRe
 
 			// Check ignore list
 			if isIgnored(relPath, cfg.Ignore) {
+				return nil
+			}
+
+			// Check skip extensions (use config or defaults)
+			skipExts := cfg.Compiler.SkipExtensions()
+			if isIgnoredExt(path, skipExts) {
 				return nil
 			}
 
@@ -129,6 +141,21 @@ func isIgnored(relPath string, ignore []string) bool {
 			return true
 		}
 		if relPath == pattern {
+			return true
+		}
+	}
+	return false
+}
+
+// isIgnoredExt checks if a file extension matches any of the skip extensions.
+func isIgnoredExt(path string, skipExts []string) bool {
+	ext := strings.TrimPrefix(filepath.Ext(path), ".")
+	if ext == "" {
+		return false
+	}
+	ext = strings.ToLower(ext)
+	for _, skip := range skipExts {
+		if strings.ToLower(skip) == ext {
 			return true
 		}
 	}
