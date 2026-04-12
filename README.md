@@ -181,7 +181,12 @@ sources:
 output: wiki                 # compiled output directory (_wiki for vault overlay)
 
 # Folders to never read or send to APIs (vault overlay mode)
-# ignore:
+ignore:
+  - .git
+  - .obsidian
+  - node_modules
+  - .sage
+  - wiki
 #   - Daily Notes
 #   - Personal
 
@@ -203,6 +208,13 @@ models:
   write: gemini-3-flash-preview
   lint: gemini-3-flash-preview
   query: gemini-3-flash-preview
+  # vision: gpt-4o-mini@vision_api  # use separate vision API (format: model@api)
+
+# Vision API (optional — separate API for image processing)
+# vision_api:
+#   provider: openai-compatible
+#   base_url: https://api.example.com/v1
+#   api_key: ${VISION_API_KEY}
 
 # Embedding provider (optional — auto-detected from api provider)
 # Override to use a different provider for embeddings
@@ -219,6 +231,10 @@ compiler:
   article_max_tokens: 4000
   auto_commit: true           # git commit after compile
   auto_lint: true             # run lint after compile
+  # vision_enabled: false     # disable image processing (default: true)
+  # skip_extensions:          # file extensions to skip (default: zip, key, exe, dll, tar, gz, 7z, rar, bin, iso, pkg, deb, rpm, msi, app)
+  #   - zip
+  #   - key
   # mode: standard            # standard, batch, or auto
   # estimate_before: false    # prompt with cost estimate before compiling
   # prompt_cache: true        # enable prompt caching (default: true)
