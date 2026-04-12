@@ -60,7 +60,8 @@ func ReEmbed(projectDir string) (int, error) {
 	embedded := 0
 	total := len(entries)
 	for i, e := range entries {
-		vec, err := embedder.EmbedChunked(e.content, 2048)
+		chunkTokens := embed.GetChunkTokens(cfg)
+		vec, err := embedder.EmbedChunked(e.content, chunkTokens)
 		if err != nil {
 			log.Warn("embedding failed", "progress", fmt.Sprintf("%d/%d", i+1, total), "id", e.id, "error", err)
 			continue

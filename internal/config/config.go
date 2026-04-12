@@ -60,11 +60,12 @@ type ModelsConfig struct {
 }
 
 type EmbedConfig struct {
-	Provider   string `yaml:"provider"`
-	Model      string `yaml:"model"`
-	Dimensions int    `yaml:"dimensions,omitempty"`
-	APIKey     string `yaml:"api_key,omitempty"`
-	BaseURL    string `yaml:"base_url,omitempty"`
+	Provider    string `yaml:"provider"`
+	Model       string `yaml:"model"`
+	Dimensions  int    `yaml:"dimensions,omitempty"`
+	APIKey      string `yaml:"api_key,omitempty"`
+	BaseURL     string `yaml:"base_url,omitempty"`
+	ChunkTokens int    `yaml:"chunk_tokens,omitempty"` // max tokens per chunk for chunked embedding
 }
 
 type CompilerConfig struct {

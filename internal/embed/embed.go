@@ -20,6 +20,14 @@ type Embedder interface {
 	Name() string
 }
 
+// GetChunkTokens returns the configured chunk tokens or default value
+func GetChunkTokens(cfg *config.Config) int {
+	if cfg != nil && cfg.Embed != nil && cfg.Embed.ChunkTokens > 0 {
+		return cfg.Embed.ChunkTokens
+	}
+	return 2048 // default
+}
+
 // Default embedding models per provider.
 var defaultModels = map[string]string{
 	"openai":  "text-embedding-3-small",
@@ -39,11 +47,12 @@ var defaultDimensions = map[string]int{
 
 // EmbedOverride holds optional overrides from the embed config block.
 type EmbedOverride struct {
-	Provider   string
-	Model      string
-	Dimensions int
-	APIKey     string
-	BaseURL    string
+	Provider    string
+	Model       string
+	Dimensions  int
+	APIKey      string
+	BaseURL     string
+	ChunkTokens int // max tokens per chunk for chunked embedding
 }
 
 // NewFromConfig creates an Embedder from the project config, using embed
@@ -52,11 +61,12 @@ func NewFromConfig(cfg *config.Config) Embedder {
 	var ov *EmbedOverride
 	if cfg.Embed != nil {
 		ov = &EmbedOverride{
-			Provider:   cfg.Embed.Provider,
-			Model:      cfg.Embed.Model,
-			Dimensions: cfg.Embed.Dimensions,
-			APIKey:     cfg.Embed.APIKey,
-			BaseURL:    cfg.Embed.BaseURL,
+			Provider:    cfg.Embed.Provider,
+			Model:       cfg.Embed.Model,
+			Dimensions:  cfg.Embed.Dimensions,
+			APIKey:      cfg.Embed.APIKey,
+			BaseURL:     cfg.Embed.BaseURL,
+			ChunkTokens: cfg.Embed.ChunkTokens,
 		}
 	}
 	return NewCascade(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, ov)

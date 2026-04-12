@@ -116,7 +116,8 @@ func ReExtract(projectDir string) (*CompileResult, error) {
 
 		relPatterns := ontology.RelationPatterns(merged)
 		log.Info("Pass 3: writing articles", "concepts", len(concepts))
-		articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields, relPatterns)
+		chunkTokens := embed.GetChunkTokens(cfg)
+		articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields, relPatterns, chunkTokens)
 
 		for _, ar := range articles {
 			if ar.Error != nil {

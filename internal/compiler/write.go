@@ -43,6 +43,7 @@ func WriteArticles(
 	userTZ *time.Location,
 	articleFields []string,
 	relationPatterns []ontology.RelationPattern,
+	chunkTokens int,
 ) []ArticleResult {
 	if maxParallel <= 0 {
 		maxParallel = 4
@@ -62,7 +63,7 @@ func WriteArticles(
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			result := writeOneArticle(projectDir, outputDir, c, client, model, maxTokens, memStore, vecStore, ontStore, embedder, userTZ, articleFields, relationPatterns)
+			result := writeOneArticle(projectDir, outputDir, c, client, model, maxTokens, memStore, vecStore, ontStore, embedder, userTZ, articleFields, relationPatterns, chunkTokens)
 			results[idx] = result
 
 			n := int(done.Add(1))
@@ -92,6 +93,7 @@ func writeOneArticle(
 	userTZ *time.Location,
 	articleFields []string,
 	relationPatterns []ontology.RelationPattern,
+	chunkTokens int,
 ) ArticleResult {
 	result := ArticleResult{ConceptName: concept.Name}
 
@@ -208,8 +210,7 @@ func writeOneArticle(
 
 	// Generate embedding (use chunked embedding to avoid context length errors)
 	if embedder != nil {
-		// Use EmbedChunked with 2048 tokens max per chunk (Ollama nomic-embed-text default context is 8192)
-		vec, err := embedder.EmbedChunked(articleContent, 2048)
+		vec, err := embedder.EmbedChunked(articleContent, chunkTokens)
 		if err != nil {
 			log.Warn("embedding failed for article", "concept", concept.Name, "error", err)
 		} else {

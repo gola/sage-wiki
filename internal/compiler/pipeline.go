@@ -327,7 +327,8 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 
 		// Generate embedding (use chunked embedding to avoid context length errors)
 		if embedder != nil {
-			vec, err := embedder.EmbedChunked(sr.Summary, 2048)
+			chunkTokens := embed.GetChunkTokens(cfg)
+			vec, err := embedder.EmbedChunked(sr.Summary, chunkTokens)
 			if err != nil {
 				log.Warn("embedding failed", "source", sr.SourcePath, "error", err)
 			} else {
@@ -398,7 +399,8 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 				}
 				relPatterns := ontology.RelationPatterns(merged)
 				progress.StartPhase("Pass 3: Write articles", len(concepts))
-				articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields, relPatterns)
+				chunkTokens := embed.GetChunkTokens(cfg)
+				articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields, relPatterns, chunkTokens)
 
 				for _, ar := range articles {
 					if ar.Error != nil {
@@ -725,7 +727,8 @@ func resumeBatch(
 		})
 
 		if embedder != nil {
-			vec, err := embedder.EmbedChunked(summaryText, 2048)
+			chunkTokens := embed.GetChunkTokens(cfg)
+			vec, err := embedder.EmbedChunked(summaryText, chunkTokens)
 			if err != nil {
 				log.Warn("embedding failed", "source", br.CustomID, "error", err)
 			} else {
@@ -796,7 +799,8 @@ func resumeBatch(
 				writeCacheID, _ := client.SetupCache("You are a knowledge base article writer. Write comprehensive, well-structured wiki articles.", writeModel)
 				relPatterns := ontology.RelationPatterns(merged)
 				progress.StartPhase("Pass 3: Write articles", len(concepts))
-				articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields, relPatterns)
+				chunkTokens := embed.GetChunkTokens(cfg)
+				articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields, relPatterns, chunkTokens)
 
 				for _, ar := range articles {
 					if ar.Error != nil {
