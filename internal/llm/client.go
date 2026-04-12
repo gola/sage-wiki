@@ -2,12 +2,15 @@ package llm
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"math/rand"
 	"net/http"
+	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -67,10 +70,25 @@ func NewClient(providerName string, apiKey string, baseURL string, rateLimit int
 		rateLimit = defaultRateLimit(providerName)
 	}
 
+	// Create HTTP client with TLS settings to avoid EOF issues
+	// Force TLS 1.2 and disable keep-alive to prevent connection issues
+	tlsConfig := &http.Transport{
+		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS12},
+		DisableKeepAlives: true,
+	}
+	if proxyURL := os.Getenv("HTTP_PROXY"); proxyURL != "" {
+		if u, err := url.Parse(proxyURL); err == nil {
+			tlsConfig.Proxy = http.ProxyURL(u)
+		}
+	}
+
 	return &Client{
 		provider: p,
 		limiter:  newRateLimiter(rateLimit),
-		client:   http.Client{Timeout: 120 * time.Second},
+		client: http.Client{
+			Timeout:   120 * time.Second,
+			Transport: tlsConfig,
+		},
 	}, nil
 }
 

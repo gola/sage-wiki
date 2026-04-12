@@ -73,6 +73,20 @@ func NewCascade(provider string, apiKey string, baseURL string, override *EmbedO
 		if p == "" {
 			p = provider
 		}
+
+		// Special case: ollama provider uses local OllamaEmbedder
+		if p == "ollama" && ollamaAvailable() {
+			model := override.Model
+			if model == "" {
+				model = "nomic-embed-text"
+			}
+			log.Info("embedding provider detected", "tier", 0, "provider", "ollama", "model", model, "dims", 768)
+			return &OllamaEmbedder{
+				model: model,
+				dims:  768,
+			}
+		}
+
 		key := override.APIKey
 		if key == "" {
 			key = apiKey
