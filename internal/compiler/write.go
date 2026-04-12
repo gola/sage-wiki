@@ -206,9 +206,10 @@ func writeOneArticle(
 		log.Error("failed to index article", "concept", concept.Name, "error", err)
 	}
 
-	// Generate embedding
+	// Generate embedding (use chunked embedding to avoid context length errors)
 	if embedder != nil {
-		vec, err := embedder.Embed(articleContent)
+		// Use EmbedChunked with 2048 tokens max per chunk (Ollama nomic-embed-text default context is 8192)
+		vec, err := embedder.EmbedChunked(articleContent, 2048)
 		if err != nil {
 			log.Warn("embedding failed for article", "concept", concept.Name, "error", err)
 		} else {

@@ -325,9 +325,9 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 			ArticlePath: sr.SummaryPath,
 		})
 
-		// Generate embedding
+		// Generate embedding (use chunked embedding to avoid context length errors)
 		if embedder != nil {
-			vec, err := embedder.Embed(sr.Summary)
+			vec, err := embedder.EmbedChunked(sr.Summary, 2048)
 			if err != nil {
 				log.Warn("embedding failed", "source", sr.SourcePath, "error", err)
 			} else {
@@ -725,7 +725,7 @@ func resumeBatch(
 		})
 
 		if embedder != nil {
-			vec, err := embedder.Embed(summaryText)
+			vec, err := embedder.EmbedChunked(summaryText, 2048)
 			if err != nil {
 				log.Warn("embedding failed", "source", br.CustomID, "error", err)
 			} else {

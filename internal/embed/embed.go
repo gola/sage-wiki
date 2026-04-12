@@ -15,6 +15,7 @@ import (
 // Embedder generates vector embeddings from text.
 type Embedder interface {
 	Embed(text string) ([]float32, error)
+	EmbedChunked(text string, maxTokens int) ([]float32, error)
 	Dimensions() int
 	Name() string
 }
@@ -29,11 +30,11 @@ var defaultModels = map[string]string{
 
 // Default dimensions per model.
 var defaultDimensions = map[string]int{
-	"text-embedding-3-small": 1536,
+	"text-embedding-3-small":     1536,
 	"gemini-embedding-2-preview": 768,
-	"voyage-3-lite":          1024,
-	"mistral-embed":          1024,
-	"nomic-embed-text":       768,
+	"voyage-3-lite":              1024,
+	"mistral-embed":              1024,
+	"nomic-embed-text":           768,
 }
 
 // EmbedOverride holds optional overrides from the embed config block.
@@ -154,14 +155,75 @@ type APIEmbedder struct {
 	client   http.Client
 }
 
-func (e *APIEmbedder) Name() string     { return fmt.Sprintf("%s/%s", e.provider, e.model) }
-func (e *APIEmbedder) Dimensions() int  { return e.dims }
+func (e *APIEmbedder) Name() string    { return fmt.Sprintf("%s/%s", e.provider, e.model) }
+func (e *APIEmbedder) Dimensions() int { return e.dims }
 
 func (e *APIEmbedder) Embed(text string) ([]float32, error) {
 	if e.provider == "gemini" {
 		return e.embedGemini(text)
 	}
 	return e.embedOpenAI(text)
+}
+
+// EmbedChunked splits text into chunks and returns averaged embedding.
+// Each chunk is limited to approximately maxTokens tokens.
+func (e *APIEmbedder) EmbedChunked(text string, maxTokens int) ([]float32, error) {
+	// Estimate: 1 token ≈ 4 characters
+	chunkSize := maxTokens * 4
+	if chunkSize < 100 {
+		chunkSize = 100
+	}
+
+	// If text is small enough, just embed directly
+	if len(text) <= chunkSize {
+		return e.Embed(text)
+	}
+
+	// Split into chunks
+	var chunks []string
+	for i := 0; i < len(text); i += chunkSize {
+		end := i + chunkSize
+		if end > len(text) {
+			end = len(text)
+		}
+		// Try to split at sentence boundary
+		if end < len(text) {
+			// Find last sentence boundary
+			for j := end - 1; j > i+chunkSize/2; j-- {
+				if text[j] == '.' || text[j] == '\n' || text[j] == '!' || text[j] == '?' {
+					end = j + 1
+					break
+				}
+			}
+		}
+		chunks = append(chunks, text[i:end])
+	}
+
+	if len(chunks) == 0 {
+		return e.Embed(text)
+	}
+
+	// Embed each chunk and average
+	var sumVec []float32
+	for _, chunk := range chunks {
+		vec, err := e.Embed(chunk)
+		if err != nil {
+			return nil, fmt.Errorf("embed chunk: %w", err)
+		}
+		if sumVec == nil {
+			sumVec = make([]float32, len(vec))
+		}
+		for i, v := range vec {
+			sumVec[i] += v
+		}
+	}
+
+	// Average
+	for i := range sumVec {
+		sumVec[i] /= float32(len(chunks))
+	}
+
+	return sumVec, nil
 }
 
 // embedOpenAI uses the OpenAI-compatible /embeddings endpoint.
@@ -289,8 +351,8 @@ type OllamaEmbedder struct {
 	client http.Client
 }
 
-func (e *OllamaEmbedder) Name() string     { return fmt.Sprintf("ollama/%s", e.model) }
-func (e *OllamaEmbedder) Dimensions() int  { return e.dims }
+func (e *OllamaEmbedder) Name() string    { return fmt.Sprintf("ollama/%s", e.model) }
+func (e *OllamaEmbedder) Dimensions() int { return e.dims }
 
 func (e *OllamaEmbedder) Embed(text string) ([]float32, error) {
 	body, _ := json.Marshal(map[string]any{
@@ -322,6 +384,59 @@ func (e *OllamaEmbedder) Embed(text string) ([]float32, error) {
 
 	e.dims = len(result.Embedding)
 	return result.Embedding, nil
+}
+
+// EmbedChunked splits text into chunks and returns averaged embedding.
+func (e *OllamaEmbedder) EmbedChunked(text string, maxTokens int) ([]float32, error) {
+	chunkSize := maxTokens * 4
+	if chunkSize < 100 {
+		chunkSize = 100
+	}
+
+	if len(text) <= chunkSize {
+		return e.Embed(text)
+	}
+
+	var chunks []string
+	for i := 0; i < len(text); i += chunkSize {
+		end := i + chunkSize
+		if end > len(text) {
+			end = len(text)
+		}
+		if end < len(text) {
+			for j := end - 1; j > i+chunkSize/2; j-- {
+				if text[j] == '.' || text[j] == '\n' || text[j] == '!' || text[j] == '?' {
+					end = j + 1
+					break
+				}
+			}
+		}
+		chunks = append(chunks, text[i:end])
+	}
+
+	if len(chunks) == 0 {
+		return e.Embed(text)
+	}
+
+	var sumVec []float32
+	for _, chunk := range chunks {
+		vec, err := e.Embed(chunk)
+		if err != nil {
+			return nil, fmt.Errorf("embed chunk: %w", err)
+		}
+		if sumVec == nil {
+			sumVec = make([]float32, len(vec))
+		}
+		for i, v := range vec {
+			sumVec[i] += v
+		}
+	}
+
+	for i := range sumVec {
+		sumVec[i] /= float32(len(chunks))
+	}
+
+	return sumVec, nil
 }
 
 // ollamaAvailable probes localhost:11434 for a running Ollama instance.
