@@ -25,7 +25,7 @@ func GetChunkTokens(cfg *config.Config) int {
 	if cfg != nil && cfg.Embed != nil && cfg.Embed.ChunkTokens > 0 {
 		return cfg.Embed.ChunkTokens
 	}
-	return 2048 // default
+	return 512 // default (nomic-embed-text supports 8192, but 512 is safer)
 }
 
 // Default embedding models per provider.
