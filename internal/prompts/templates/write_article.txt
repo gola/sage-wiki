@@ -9,6 +9,11 @@ Related concepts: {{.RelatedList}}
 {{.ExistingArticle}}
 {{end}}
 
+{{if .SourceContext}}
+## Relevant source material:
+{{.SourceContext}}
+{{end}}
+
 {{if .Learnings}}
 ## Learnings from previous compilations (follow these):
 {{.Learnings}}

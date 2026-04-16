@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/xoai/sage-wiki/internal/compiler"
+	"github.com/xoai/sage-wiki/internal/storage"
 	"github.com/xoai/sage-wiki/internal/tui"
 	"github.com/xoai/sage-wiki/internal/tui/components"
 )
@@ -30,6 +31,7 @@ type CompileCompleteMsg struct {
 	result    *compiler.CompileResult
 	err       error
 	costInfo  string // formatted cost summary (single line)
+	tierInfo  string // formatted tier distribution (single line)
 }
 
 // fileChangeMsg signals output files changed (for watch mode).
@@ -61,6 +63,7 @@ type Model struct {
 	lastResult *compiler.CompileResult
 	lastError  error
 	costInfo   string // cost report summary line
+	tierInfo   string // tier distribution summary
 	snapshot   string // source dir hash for change detection
 
 	projectDir  string
@@ -160,6 +163,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastResult = msg.result
 		m.lastError = msg.err
 		m.costInfo = msg.costInfo
+		m.tierInfo = msg.tierInfo
 		m.watching = true
 		m.scanOutputFiles()
 		m.snapshot = m.dirSnapshot()
@@ -288,6 +292,9 @@ func (m Model) statusInfo() string {
 		r := m.lastResult
 		info := fmt.Sprintf("%d summarized, %d concepts, %d articles",
 			r.Summarized, r.ConceptsExtracted, r.ArticlesWritten)
+		if m.tierInfo != "" {
+			info += " | " + m.tierInfo
+		}
 		if m.costInfo != "" {
 			info += " | " + m.costInfo
 		}
@@ -309,8 +316,37 @@ func (m Model) runCompile() tea.Cmd {
 				costLine += fmt.Sprintf(" (saved $%.4f)", result.CostReport.CacheSavings)
 			}
 		}
-		return CompileCompleteMsg{result: result, err: err, costInfo: costLine}
+
+		// Query tier distribution from compile_items
+		tierLine := queryTierLine(m.projectDir)
+
+		return CompileCompleteMsg{result: result, err: err, costInfo: costLine, tierInfo: tierLine}
 	}
+}
+
+// queryTierLine returns a compact tier distribution string like "T0:5 T1:90 T3:3".
+func queryTierLine(projectDir string) string {
+	dbPath := filepath.Join(projectDir, ".sage", "wiki.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		return ""
+	}
+	defer db.Close()
+
+	items := compiler.NewCompileItemStore(db)
+	stats, err := items.Stats()
+	if err != nil || stats.TotalSources == 0 {
+		return ""
+	}
+
+	var parts []string
+	tierNames := map[int]string{0: "T0", 1: "T1", 2: "T2", 3: "T3"}
+	for tier := 0; tier <= 3; tier++ {
+		if count, ok := stats.ByTier[tier]; ok && count > 0 {
+			parts = append(parts, fmt.Sprintf("%s:%d", tierNames[tier], count))
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 func (m Model) scanTick() tea.Cmd {

@@ -1,0 +1,569 @@
+package compiler
+
+import (
+	"database/sql"
+	"fmt"
+	"time"
+
+	"github.com/xoai/sage-wiki/internal/storage"
+)
+
+// CompileItem represents a source file's compilation state.
+type CompileItem struct {
+	SourcePath  string
+	Hash        string
+	FileType    string
+	SizeBytes   int64
+	Tier        int
+	TierDefault int
+	TierOverride *int // nil = no override
+
+	// Per-pass completion
+	PassIndexed    bool
+	PassEmbedded   bool
+	PassParsed     bool
+	PassSummarized bool
+	PassExtracted  bool
+	PassWritten    bool
+
+	// Compilation metadata
+	CompileID   string
+	Error       string
+	ErrorCount  int
+	SummaryPath string
+
+	// Promotion/demotion signals
+	QueryHitCount int
+	LastQueriedAt string
+	PromotedAt    string
+	DemotedAt     string
+
+	// Quality tracking
+	SourceType   string
+	QualityScore *float64
+
+	CreatedAt string
+	UpdatedAt string
+}
+
+// CompileStats holds tier distribution and progress statistics.
+type CompileStats struct {
+	TotalSources  int
+	ByTier        map[int]int // tier -> count
+	BySourceType  map[string]int
+	FullyCompiled int // pass_written=1
+	WithErrors    int
+	AvgQuality    float64
+}
+
+// CompileItemStore provides CRUD operations for the compile_items table.
+type CompileItemStore struct {
+	db *storage.DB
+}
+
+// NewCompileItemStore creates a new CompileItemStore.
+func NewCompileItemStore(db *storage.DB) *CompileItemStore {
+	return &CompileItemStore{db: db}
+}
+
+// Upsert inserts or updates a compile item.
+func (s *CompileItemStore) Upsert(item CompileItem) error {
+	return s.db.WriteTx(func(tx *sql.Tx) error {
+		var tierOverride sql.NullInt64
+		if item.TierOverride != nil {
+			tierOverride = sql.NullInt64{Int64: int64(*item.TierOverride), Valid: true}
+		}
+		var qualityScore sql.NullFloat64
+		if item.QualityScore != nil {
+			qualityScore = sql.NullFloat64{Float64: *item.QualityScore, Valid: true}
+		}
+		_, err := tx.Exec(`
+			INSERT INTO compile_items (
+				source_path, hash, file_type, size_bytes,
+				tier, tier_default, tier_override,
+				pass_indexed, pass_embedded, pass_parsed,
+				pass_summarized, pass_extracted, pass_written,
+				compile_id, error, error_count, summary_path,
+				query_hit_count, last_queried_at, promoted_at, demoted_at,
+				source_type, quality_score, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+			ON CONFLICT(source_path) DO UPDATE SET
+				hash=excluded.hash, file_type=excluded.file_type, size_bytes=excluded.size_bytes,
+				tier=excluded.tier, tier_default=excluded.tier_default, tier_override=excluded.tier_override,
+				pass_indexed=excluded.pass_indexed, pass_embedded=excluded.pass_embedded,
+				pass_parsed=excluded.pass_parsed, pass_summarized=excluded.pass_summarized,
+				pass_extracted=excluded.pass_extracted, pass_written=excluded.pass_written,
+				compile_id=excluded.compile_id, error=excluded.error, error_count=excluded.error_count,
+				summary_path=excluded.summary_path, source_type=excluded.source_type,
+				quality_score=excluded.quality_score, updated_at=datetime('now')
+		`,
+			item.SourcePath, item.Hash, item.FileType, item.SizeBytes,
+			item.Tier, item.TierDefault, tierOverride,
+			boolToInt(item.PassIndexed), boolToInt(item.PassEmbedded), boolToInt(item.PassParsed),
+			boolToInt(item.PassSummarized), boolToInt(item.PassExtracted), boolToInt(item.PassWritten),
+			item.CompileID, item.Error, item.ErrorCount, item.SummaryPath,
+			item.QueryHitCount, nilIfEmpty(item.LastQueriedAt), nilIfEmpty(item.PromotedAt), nilIfEmpty(item.DemotedAt),
+			item.SourceType, qualityScore,
+		)
+		return err
+	})
+}
+
+// GetByPath returns a single compile item.
+func (s *CompileItemStore) GetByPath(path string) (*CompileItem, error) {
+	row := s.db.ReadDB().QueryRow(`
+		SELECT source_path, hash, file_type, size_bytes,
+			tier, tier_default, tier_override,
+			pass_indexed, pass_embedded, pass_parsed,
+			pass_summarized, pass_extracted, pass_written,
+			compile_id, error, error_count, summary_path,
+			query_hit_count, last_queried_at, promoted_at, demoted_at,
+			source_type, quality_score, created_at, updated_at
+		FROM compile_items WHERE source_path = ?
+	`, path)
+	return scanCompileItem(row)
+}
+
+// ListByTier returns all items at a given tier.
+func (s *CompileItemStore) ListByTier(tier int) ([]CompileItem, error) {
+	rows, err := s.db.ReadDB().Query(`
+		SELECT source_path, hash, file_type, size_bytes,
+			tier, tier_default, tier_override,
+			pass_indexed, pass_embedded, pass_parsed,
+			pass_summarized, pass_extracted, pass_written,
+			compile_id, error, error_count, summary_path,
+			query_hit_count, last_queried_at, promoted_at, demoted_at,
+			source_type, quality_score, created_at, updated_at
+		FROM compile_items WHERE tier = ?
+	`, tier)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanCompileItems(rows)
+}
+
+// ListPending returns items that need work at their current tier.
+// For Tier 0: pass_indexed=0. For Tier 1: pass_embedded=0.
+// For Tier 3: any of pass_summarized/pass_extracted/pass_written=0.
+func (s *CompileItemStore) ListPending(tier int) ([]CompileItem, error) {
+	var where string
+	switch tier {
+	case 0:
+		where = "tier >= 0 AND pass_indexed = 0"
+	case 1:
+		where = "tier >= 1 AND pass_embedded = 0"
+	case 2:
+		where = "tier >= 2 AND pass_parsed = 0"
+	case 3:
+		where = "tier >= 3 AND (pass_summarized = 0 OR pass_extracted = 0 OR pass_written = 0)"
+	default:
+		return nil, fmt.Errorf("invalid tier: %d", tier)
+	}
+
+	rows, err := s.db.ReadDB().Query(fmt.Sprintf(`
+		SELECT source_path, hash, file_type, size_bytes,
+			tier, tier_default, tier_override,
+			pass_indexed, pass_embedded, pass_parsed,
+			pass_summarized, pass_extracted, pass_written,
+			compile_id, error, error_count, summary_path,
+			query_hit_count, last_queried_at, promoted_at, demoted_at,
+			source_type, quality_score, created_at, updated_at
+		FROM compile_items WHERE %s
+	`, where))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanCompileItems(rows)
+}
+
+// MarkPass marks a specific pass complete for a source.
+func (s *CompileItemStore) MarkPass(path string, pass string) error {
+	col, ok := passColumn(pass)
+	if !ok {
+		return fmt.Errorf("unknown pass: %s", pass)
+	}
+	return s.db.WriteTx(func(tx *sql.Tx) error {
+		_, err := tx.Exec(fmt.Sprintf(
+			"UPDATE compile_items SET %s = 1, updated_at = datetime('now') WHERE source_path = ?", col,
+		), path)
+		return err
+	})
+}
+
+// SetTier changes an item's tier. Idempotent — retains existing pass flags.
+// A source promoted from Tier 1 to Tier 3 keeps pass_indexed=1, pass_embedded=1.
+func (s *CompileItemStore) SetTier(path string, tier int, reason string) error {
+	return s.db.WriteTx(func(tx *sql.Tx) error {
+		now := time.Now().UTC().Format(time.RFC3339)
+		// Determine if this is promotion or demotion for timestamp fields
+		var currentTier int
+		err := tx.QueryRow("SELECT tier FROM compile_items WHERE source_path = ?", path).Scan(&currentTier)
+		if err != nil {
+			return fmt.Errorf("SetTier: source not found: %s", path)
+		}
+
+		promotedAt := sql.NullString{}
+		demotedAt := sql.NullString{}
+		if tier > currentTier {
+			promotedAt = sql.NullString{String: now, Valid: true}
+		} else if tier < currentTier {
+			demotedAt = sql.NullString{String: now, Valid: true}
+		}
+
+		_, err = tx.Exec(`
+			UPDATE compile_items SET tier = ?, promoted_at = COALESCE(?, promoted_at),
+				demoted_at = COALESCE(?, demoted_at), updated_at = datetime('now')
+			WHERE source_path = ?
+		`, tier, promotedAt, demotedAt, path)
+		return err
+	})
+}
+
+// MarkError records an error for a source and increments the error count.
+func (s *CompileItemStore) MarkError(path string, compileErr error) error {
+	return s.db.WriteTx(func(tx *sql.Tx) error {
+		_, err := tx.Exec(`
+			UPDATE compile_items SET error = ?, error_count = error_count + 1,
+				updated_at = datetime('now') WHERE source_path = ?
+		`, compileErr.Error(), path)
+		return err
+	})
+}
+
+// IncrementQueryHits increments hit counts for the given source paths.
+// Uses batch IN clauses for efficiency, chunked at 500 paths to stay
+// well under SQLite's parameter limit.
+func (s *CompileItemStore) IncrementQueryHits(paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	return s.db.WriteTx(func(tx *sql.Tx) error {
+		now := time.Now().UTC().Format(time.RFC3339)
+		for _, chunk := range chunkStrings(paths, 500) {
+			placeholders, args := buildInClause(chunk)
+			// Prepend now to args (for last_queried_at)
+			allArgs := make([]interface{}, 0, 1+len(args))
+			allArgs = append(allArgs, now)
+			allArgs = append(allArgs, args...)
+			_, err := tx.Exec(`
+				UPDATE compile_items SET query_hit_count = query_hit_count + 1,
+					last_queried_at = ?, updated_at = datetime('now')
+				WHERE source_path IN (`+placeholders+`)
+			`, allArgs...)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// Stats returns tier distribution and compilation progress.
+func (s *CompileItemStore) Stats() (*CompileStats, error) {
+	stats := &CompileStats{
+		ByTier:       make(map[int]int),
+		BySourceType: make(map[string]int),
+	}
+
+	// Tier distribution
+	rows, err := s.db.ReadDB().Query("SELECT tier, COUNT(*) FROM compile_items GROUP BY tier")
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var tier, count int
+		if err := rows.Scan(&tier, &count); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		stats.ByTier[tier] = count
+		stats.TotalSources += count
+	}
+	rows.Close()
+
+	// Source type distribution
+	rows, err = s.db.ReadDB().Query("SELECT source_type, COUNT(*) FROM compile_items GROUP BY source_type")
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var st string
+		var count int
+		if err := rows.Scan(&st, &count); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		stats.BySourceType[st] = count
+	}
+	rows.Close()
+
+	// Fully compiled count
+	err = s.db.ReadDB().QueryRow("SELECT COUNT(*) FROM compile_items WHERE pass_written = 1").Scan(&stats.FullyCompiled)
+	if err != nil {
+		return nil, err
+	}
+
+	// Error count
+	err = s.db.ReadDB().QueryRow("SELECT COUNT(*) FROM compile_items WHERE error IS NOT NULL AND error != ''").Scan(&stats.WithErrors)
+	if err != nil {
+		return nil, err
+	}
+
+	// Average quality score
+	var avgQ sql.NullFloat64
+	err = s.db.ReadDB().QueryRow("SELECT AVG(quality_score) FROM compile_items WHERE quality_score IS NOT NULL").Scan(&avgQ)
+	if err != nil {
+		return nil, err
+	}
+	if avgQ.Valid {
+		stats.AvgQuality = avgQ.Float64
+	}
+
+	return stats, nil
+}
+
+// DeleteByPaths removes compile items for the given paths.
+// Uses batch IN clauses for efficiency, chunked at 500 paths.
+func (s *CompileItemStore) DeleteByPaths(paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	return s.db.WriteTx(func(tx *sql.Tx) error {
+		for _, chunk := range chunkStrings(paths, 500) {
+			placeholders, args := buildInClause(chunk)
+			_, err := tx.Exec("DELETE FROM compile_items WHERE source_path IN ("+placeholders+")", args...)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// buildInClause builds a parameterized IN clause: "?, ?, ?" and []interface{}{a, b, c}.
+func buildInClause(values []string) (string, []interface{}) {
+	args := make([]interface{}, len(values))
+	placeholders := make([]byte, 0, len(values)*2)
+	for i, v := range values {
+		if i > 0 {
+			placeholders = append(placeholders, ',')
+		}
+		placeholders = append(placeholders, '?')
+		args[i] = v
+	}
+	return string(placeholders), args
+}
+
+// chunkStrings splits a slice into chunks of at most size n.
+func chunkStrings(s []string, n int) [][]string {
+	if len(s) <= n {
+		return [][]string{s}
+	}
+	var chunks [][]string
+	for i := 0; i < len(s); i += n {
+		end := i + n
+		if end > len(s) {
+			end = len(s)
+		}
+		chunks = append(chunks, s[i:end])
+	}
+	return chunks
+}
+
+// SetQualityScore updates the quality_score for a source.
+func (s *CompileItemStore) SetQualityScore(path string, score float64) error {
+	return s.db.WriteTx(func(tx *sql.Tx) error {
+		_, err := tx.Exec(
+			"UPDATE compile_items SET quality_score = ?, updated_at = datetime('now') WHERE source_path = ?",
+			score, path,
+		)
+		return err
+	})
+}
+
+// Count returns the total number of compile items.
+func (s *CompileItemStore) Count() (int, error) {
+	var count int
+	err := s.db.ReadDB().QueryRow("SELECT COUNT(*) FROM compile_items").Scan(&count)
+	return count, err
+}
+
+// ListPromotionCandidates returns Tier 0-1 source paths with query_hit_count
+// at or above the given threshold. Filtering is done in SQL to avoid loading
+// all low-tier items into memory at scale.
+func (s *CompileItemStore) ListPromotionCandidates(hitThreshold int) ([]string, error) {
+	rows, err := s.db.ReadDB().Query(
+		`SELECT source_path FROM compile_items
+		 WHERE tier IN (0, 1) AND query_hit_count >= ?`,
+		hitThreshold,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		paths = append(paths, p)
+	}
+	return paths, rows.Err()
+}
+
+// ListDemotionCandidates returns Tier 3 source paths that are stale —
+// either last queried before the threshold date, or never queried and
+// created before the threshold date. Filtering is done in SQL.
+func (s *CompileItemStore) ListDemotionCandidates(staleThreshold string) ([]string, error) {
+	rows, err := s.db.ReadDB().Query(
+		`SELECT source_path FROM compile_items WHERE tier = 3
+		 AND (
+		   (last_queried_at != '' AND last_queried_at < ?)
+		   OR (last_queried_at IS NULL AND created_at < ?)
+		   OR (last_queried_at = '' AND created_at < ?)
+		 )`,
+		staleThreshold, staleThreshold, staleThreshold,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		paths = append(paths, p)
+	}
+	return paths, rows.Err()
+}
+
+// helpers
+
+func passColumn(pass string) (string, bool) {
+	switch pass {
+	case "indexed":
+		return "pass_indexed", true
+	case "embedded":
+		return "pass_embedded", true
+	case "parsed":
+		return "pass_parsed", true
+	case "summarized":
+		return "pass_summarized", true
+	case "extracted":
+		return "pass_extracted", true
+	case "written":
+		return "pass_written", true
+	default:
+		return "", false
+	}
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func nilIfEmpty(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+func scanCompileItem(row *sql.Row) (*CompileItem, error) {
+	var item CompileItem
+	var tierOverride sql.NullInt64
+	var qualityScore sql.NullFloat64
+	var compileID, errStr, summaryPath, lastQueried, promoted, demoted sql.NullString
+	var passIdx, passEmbed, passParse, passSum, passExt, passWrite int
+
+	err := row.Scan(
+		&item.SourcePath, &item.Hash, &item.FileType, &item.SizeBytes,
+		&item.Tier, &item.TierDefault, &tierOverride,
+		&passIdx, &passEmbed, &passParse, &passSum, &passExt, &passWrite,
+		&compileID, &errStr, &item.ErrorCount, &summaryPath,
+		&item.QueryHitCount, &lastQueried, &promoted, &demoted,
+		&item.SourceType, &qualityScore, &item.CreatedAt, &item.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if tierOverride.Valid {
+		v := int(tierOverride.Int64)
+		item.TierOverride = &v
+	}
+	if qualityScore.Valid {
+		item.QualityScore = &qualityScore.Float64
+	}
+	item.PassIndexed = passIdx == 1
+	item.PassEmbedded = passEmbed == 1
+	item.PassParsed = passParse == 1
+	item.PassSummarized = passSum == 1
+	item.PassExtracted = passExt == 1
+	item.PassWritten = passWrite == 1
+	item.CompileID = compileID.String
+	item.Error = errStr.String
+	item.SummaryPath = summaryPath.String
+	item.LastQueriedAt = lastQueried.String
+	item.PromotedAt = promoted.String
+	item.DemotedAt = demoted.String
+
+	return &item, nil
+}
+
+func scanCompileItems(rows *sql.Rows) ([]CompileItem, error) {
+	var items []CompileItem
+	for rows.Next() {
+		var item CompileItem
+		var tierOverride sql.NullInt64
+		var qualityScore sql.NullFloat64
+		var compileID, errStr, summaryPath, lastQueried, promoted, demoted sql.NullString
+		var passIdx, passEmbed, passParse, passSum, passExt, passWrite int
+
+		err := rows.Scan(
+			&item.SourcePath, &item.Hash, &item.FileType, &item.SizeBytes,
+			&item.Tier, &item.TierDefault, &tierOverride,
+			&passIdx, &passEmbed, &passParse, &passSum, &passExt, &passWrite,
+			&compileID, &errStr, &item.ErrorCount, &summaryPath,
+			&item.QueryHitCount, &lastQueried, &promoted, &demoted,
+			&item.SourceType, &qualityScore, &item.CreatedAt, &item.UpdatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if tierOverride.Valid {
+			v := int(tierOverride.Int64)
+			item.TierOverride = &v
+		}
+		if qualityScore.Valid {
+			item.QualityScore = &qualityScore.Float64
+		}
+		item.PassIndexed = passIdx == 1
+		item.PassEmbedded = passEmbed == 1
+		item.PassParsed = passParse == 1
+		item.PassSummarized = passSum == 1
+		item.PassExtracted = passExt == 1
+		item.PassWritten = passWrite == 1
+		item.CompileID = compileID.String
+		item.Error = errStr.String
+		item.SummaryPath = summaryPath.String
+		item.LastQueriedAt = lastQueried.String
+		item.PromotedAt = promoted.String
+		item.DemotedAt = demoted.String
+
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}

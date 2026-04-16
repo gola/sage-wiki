@@ -24,23 +24,25 @@ import (
 
 // CompileOpts configures a compilation run.
 type CompileOpts struct {
-	DryRun  bool
-	Fresh   bool             // ignore checkpoint
-	Batch   bool             // use batch API (async, 50% discount)
-	NoCache bool             // disable prompt caching
-	Tracker *llm.CostTracker // optional cost tracker
+	DryRun   bool
+	Fresh    bool              // ignore checkpoint
+	Batch    bool              // use batch API (async, 50% discount)
+	NoCache  bool              // disable prompt caching
+	Prune    bool              // delete orphaned articles when sources removed
+	Tracker  *llm.CostTracker  // optional cost tracker
 }
 
 // CompileResult summarizes what happened during compilation.
 type CompileResult struct {
-	Added             int
-	Modified          int
-	Removed           int
-	Summarized        int
-	ConceptsExtracted int
-	ArticlesWritten   int
-	Errors            int
-	CostReport        *llm.CostReport // nil if no LLM calls were made
+	Added              int
+	Modified           int
+	Removed            int
+	Summarized         int
+	ConceptsExtracted  int
+	ArticlesWritten    int
+	Errors             int
+	EmbedErrors        int
+	CostReport         *llm.CostReport // nil if no LLM calls were made
 }
 
 // CompileState tracks progress for checkpoint/resume (ADR-018).
@@ -136,7 +138,7 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 	}
 
 	// Create LLM client
-	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit, cfg.API.TimeoutSeconds)
+	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit, llm.WithExtraParams(cfg.API.ExtraParams), llm.WithTimeout(cfg.API.TimeoutSeconds))
 	if err != nil {
 		return nil, fmt.Errorf("compile: create LLM client: %w", err)
 	}
@@ -190,8 +192,45 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 	memStore := memory.NewStore(db)
 	vecStore := vectors.NewStore(db)
 	embedder := embed.NewFromConfig(cfg)
+	chunkStore := memory.NewChunkStore(db)
 
-	// Initialize checkpoint state
+	merged := ontology.MergedRelations(cfg.Ontology.Relations)
+	mergedTypes := ontology.MergedEntityTypes(cfg.Ontology.EntityTypes)
+	pipelineOntStore := ontology.NewStore(db, ontology.ValidRelationNames(merged), ontology.ValidEntityTypeNames(mergedTypes))
+
+	// Backfill chunk index if needed (after migration, before first compile)
+	if chunkStore.NeedsBackfill(memStore) {
+		log.Info("chunk index empty with existing articles — running backfill")
+		if err := BackfillChunks(projectDir, cfg.Output, cfg.Search.ChunkSizeOrDefault(), chunkStore, vecStore, embedder, db); err != nil {
+			log.Warn("chunk backfill failed", "error", err)
+		}
+	}
+
+	// Initialize compile_items store and tier manager
+	itemStore := NewCompileItemStore(db)
+	tierMgr := NewTierManager(&cfg.Compiler, itemStore)
+	bp := NewBackpressureController(cfg.Compiler.MaxParallel)
+
+	// Populate compile_items from manifest on first run (if empty)
+	if count, _ := itemStore.Count(); count == 0 && mf.SourceCount() > 0 {
+		populated, err := PopulateFromManifest(db, mf, cfg)
+		if err != nil {
+			log.Warn("populate compile_items from manifest failed", "error", err)
+		} else if populated > 0 {
+			log.Info("populated compile_items from manifest", "count", populated)
+		}
+	}
+
+	// Migrate legacy checkpoint if present
+	if !opts.Fresh {
+		if migrated, err := MigrateCheckpoint(projectDir, db, mf, cfg); err != nil {
+			log.Warn("checkpoint migration failed", "error", err)
+		} else if migrated {
+			log.Info("legacy checkpoint migrated to compile_items")
+		}
+	}
+
+	// Initialize legacy checkpoint state (retained for fallback)
 	if state == nil {
 		state = &CompileState{
 			CompileID: time.Now().Format("20060102-150405"),
@@ -200,8 +239,55 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 		}
 	}
 
-	// Merge new files from diff into checkpoint pending list
-	// This handles files added while the watcher was stopped
+	// Resolve tiers and upsert compile_items for new/modified sources
+	allSources := append(diff.Added, diff.Modified...)
+	compileID := state.CompileID
+	for _, src := range allSources {
+		tier := tierMgr.ResolveTier(src.Path, projectDir, nil)
+		itemStore.Upsert(CompileItem{
+			SourcePath:  src.Path,
+			Hash:        src.Hash,
+			FileType:    src.Type,
+			SizeBytes:   src.Size,
+			Tier:        tier,
+			TierDefault: tierMgr.ConfigDefault(src.Path),
+			SourceType:  "compiler",
+			CompileID:   compileID,
+		})
+	}
+
+	// Tier 0: FTS5 index only (no LLM, ~5ms/doc)
+	tier0Pending, _ := itemStore.ListPending(0)
+	if len(tier0Pending) > 0 {
+		progress.StartPhase("Tier 0: Index sources", len(tier0Pending))
+		indexed := indexRawSources(projectDir, tier0Pending, memStore, itemStore)
+		log.Info("tier 0 indexing complete", "indexed", indexed)
+		progress.EndPhase()
+	}
+
+	// Tier 1: FTS5 + vector embed (~200ms/doc)
+	tier1Pending, _ := itemStore.ListPending(1)
+	if len(tier1Pending) > 0 {
+		progress.StartPhase("Tier 1: Index + embed sources", len(tier1Pending))
+		indexed, embedded := indexAndEmbedSources(projectDir, tier1Pending, memStore, vecStore, embedder, itemStore, bp)
+		log.Info("tier 1 indexing complete", "indexed", indexed, "embedded", embedded)
+		progress.EndPhase()
+	}
+
+	// Tier 3: Full LLM pipeline (Pass 1 → 2 → 3) — only for Tier 3 sources
+	tier3Pending, _ := itemStore.ListPending(3)
+	var toProcess []SourceInfo
+	tier3Set := make(map[string]bool)
+	for _, item := range tier3Pending {
+		tier3Set[item.SourcePath] = true
+	}
+	for _, s := range allSources {
+		if tier3Set[s.Path] {
+			toProcess = append(toProcess, s)
+		}
+	}
+
+	// Also include sources from legacy checkpoint pending list
 	completedSet := make(map[string]bool)
 	for _, p := range state.Completed {
 		completedSet[p] = true
@@ -210,214 +296,84 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 	for _, p := range state.Pending {
 		pendingSet[p] = true
 	}
-	for _, s := range append(diff.Added, diff.Modified...) {
-		if !completedSet[s.Path] && !pendingSet[s.Path] {
-			state.Pending = append(state.Pending, s.Path)
-			pendingSet[s.Path] = true
-			log.Info("new source added to compile queue", "path", s.Path)
-		}
-	}
-
-	// If new files were added, reset pass to 1 so they get summarized
-	newFiles := false
-	var toProcess []SourceInfo
-	for _, s := range append(diff.Added, diff.Modified...) {
-		if pendingSet[s.Path] {
-			toProcess = append(toProcess, s)
-			if !completedSet[s.Path] {
-				newFiles = true
-			}
-		}
-	}
-	if newFiles && state.Pass > 1 {
-		log.Info("new sources detected, resetting to Pass 1")
-		state.Pass = 1
-	}
-	client.SetPass("summarize")
-	// Setup prompt cache for summarize pass (respects --no-cache and config)
-	cacheEnabled := cfg.Compiler.PromptCacheEnabled() && !opts.NoCache
-	var sumCacheID string
-	if cacheEnabled {
-		sumCacheID, _ = client.SetupCache("You are a research assistant creating structured summaries for a personal knowledge wiki.", cfg.Models.Summarize)
-	}
-	progress.StartPhase("Pass 1: Summarize sources", len(toProcess))
-
-	model := cfg.Models.Summarize
-	if model == "" {
-		model = "gpt-4o-mini"
-	}
-	maxTokens := cfg.Compiler.SummaryMaxTokens
-	if maxTokens <= 0 {
-		maxTokens = 2000
-	}
-
-	// Determine vision configuration
-	var visionClient *llm.Client
-	visionModel := cfg.Models.Vision
-	visionEnabled := cfg.Compiler.VisionEnabled()
-
-	// Parse vision model reference (e.g., "gpt-4o-mini@vision_api" or "gpt-4o-mini@api" or "gpt-4o-mini")
-	visionModelName, visionAPIRef := config.ParseModelRef(visionModel, "api")
-
-	// Create vision client if enabled
-	if visionEnabled && visionModelName != "" {
-		if visionAPIRef == "vision_api" && cfg.VisionAPI != nil && (cfg.VisionAPI.Provider != "" || cfg.VisionAPI.BaseURL != "" || cfg.VisionAPI.APIKey != "") {
-			// Use separate vision API
-			visionTimeout := cfg.VisionAPI.TimeoutSeconds
-			if visionTimeout <= 0 {
-				visionTimeout = cfg.API.TimeoutSeconds // fallback to main API timeout
-			}
-			vc, err := llm.NewVisionClient(
-				cfg.VisionAPI.Provider,
-				cfg.VisionAPI.APIKey,
-				cfg.VisionAPI.BaseURL,
-				cfg.API.RateLimit,
-				visionTimeout,
-			)
-			if err != nil {
-				log.Warn("failed to create vision client, falling back to main client", "error", err)
-			} else {
-				visionClient = vc
-				// Use model from vision_api config if not specified in the ref
-				if visionModel == cfg.Models.Vision && cfg.VisionAPI.Model != "" {
-					visionModelName = cfg.VisionAPI.Model
+	for _, s := range allSources {
+		if !completedSet[s.Path] && !pendingSet[s.Path] && !tier3Set[s.Path] {
+			// Check if this source should be in the legacy pending list
+			item, _ := itemStore.GetByPath(s.Path)
+			if item != nil && item.Tier >= 3 && !item.PassWritten {
+				state.Pending = append(state.Pending, s.Path)
+				if !tier3Set[s.Path] {
+					toProcess = append(toProcess, s)
+					tier3Set[s.Path] = true
 				}
 			}
-		} else {
-			// Use main API (default) with the specified model
-			visionClient = client
 		}
 	}
 
-	summaries := Summarize(projectDir, cfg.Output, toProcess, client, model, maxTokens, cfg.Compiler.MaxParallel, cfg.Compiler.UserTimeLocation(), visionClient, visionModelName, visionEnabled)
-
-	for _, sr := range summaries {
-		if sr.Error != nil {
-			result.Errors++
-			progress.ItemError(sr.SourcePath, sr.Error)
-			state.Failed = append(state.Failed, FailedSource{
-				Path:  sr.SourcePath,
-				Error: sr.Error.Error(),
-			})
-			continue
-		}
-
-		result.Summarized++
-		progress.ItemDone(sr.SourcePath, sr.SummaryPath)
-
-		// Update manifest — register or update source hash
-		for _, s := range toProcess {
-			if s.Path == sr.SourcePath {
-				if _, exists := mf.Sources[sr.SourcePath]; !exists {
-					// New source
-					mf.AddSource(s.Path, s.Hash, s.Type, s.Size)
-				} else {
-					// Existing source — update hash so it's not flagged as modified next time
-					src := mf.Sources[sr.SourcePath]
-					src.Hash = s.Hash
-					mf.Sources[sr.SourcePath] = src
-				}
-				break
-			}
-		}
-		mf.MarkCompiled(sr.SourcePath, sr.SummaryPath, sr.Concepts)
-
-		// Index in FTS5
-		memStore.Add(memory.Entry{
-			ID:          sr.SourcePath,
-			Content:     sr.Summary,
-			Tags:        []string{extractType(sr.SourcePath)},
-			ArticlePath: sr.SummaryPath,
+	if len(toProcess) > 0 {
+		cacheEnabled := cfg.Compiler.PromptCacheEnabled() && !opts.NoCache
+		pipelineResult := runFullPipeline(toProcess, FullPipelineOpts{
+			ProjectDir:   projectDir,
+			Config:       cfg,
+			Client:       client,
+			Manifest:     mf,
+			DB:           db,
+			MemStore:     memStore,
+			VecStore:     vecStore,
+			ChunkStore:   chunkStore,
+			OntStore:     pipelineOntStore,
+			Embedder:     embedder,
+			Backpressure: bp,
+			ItemStore:    itemStore,
+			CacheEnabled: cacheEnabled,
+			Progress:     progress,
+			State:        state,
+			StatePath:    statePath,
 		})
+		result.Summarized = pipelineResult.Summarized
+		result.ConceptsExtracted = pipelineResult.ConceptsExtracted
+		result.ArticlesWritten = pipelineResult.ArticlesWritten
+		result.Errors += pipelineResult.Errors
+		result.EmbedErrors = pipelineResult.EmbedErrors
 
-		// Generate embedding (use chunked embedding to avoid context length errors)
-		if embedder != nil {
-			chunkTokens := embed.GetChunkTokens(cfg)
-			vec, err := embedder.EmbedChunked(sr.Summary, chunkTokens)
-			if err != nil {
-				log.Warn("embedding failed", "source", sr.SourcePath, "error", err)
-			} else {
-				vecStore.Upsert(sr.SourcePath, vec)
+		// Mark Tier 3 passes only for sources that succeeded
+		succeeded := make(map[string]bool)
+		for _, p := range pipelineResult.SucceededSources {
+			succeeded[p] = true
+		}
+		for _, s := range toProcess {
+			if succeeded[s.Path] {
+				if err := itemStore.MarkPass(s.Path, "summarized"); err != nil {
+					log.Warn("mark pass failed", "path", s.Path, "pass", "summarized", "error", err)
+				}
+				if err := itemStore.MarkPass(s.Path, "extracted"); err != nil {
+					log.Warn("mark pass failed", "path", s.Path, "pass", "extracted", "error", err)
+				}
+				if err := itemStore.MarkPass(s.Path, "written"); err != nil {
+					log.Warn("mark pass failed", "path", s.Path, "pass", "written", "error", err)
+				}
 			}
 		}
-
-		// Update checkpoint
-		removeFromPending(state, sr.SourcePath)
-		state.Completed = append(state.Completed, sr.SourcePath)
-		saveCompileState(statePath, state)
 	}
 
-	// Update checkpoint pass
-	client.TeardownCache(sumCacheID)
-	state.Pass = 2
-	saveCompileState(statePath, state)
-
-	// Pass 2: Concept extraction
-	successfulSummaries := filterSuccessful(summaries)
-	if len(successfulSummaries) > 0 {
-		extractModel := cfg.Models.Extract
-		if extractModel == "" {
-			extractModel = model
-		}
-
-		client.SetPass("extract")
-		var extCacheID string
-		if cacheEnabled {
-			extCacheID, _ = client.SetupCache("You are an expert knowledge organizer. Extract structured concepts from source summaries.", extractModel)
-		}
-		progress.StartPhase("Pass 2: Extract concepts", len(successfulSummaries))
-		concepts, err := ExtractConcepts(successfulSummaries, mf.Concepts, client, extractModel)
-		if err != nil {
-			progress.ItemError("concept extraction", err)
-			result.Errors++
-		} else {
-			result.ConceptsExtracted = len(concepts)
-
-			// Report discovered concepts
-			var conceptNames []string
-			for _, c := range concepts {
-				conceptNames = append(conceptNames, c.Name)
-				mf.AddConcept(c.Name, filepath.Join(cfg.Output, "concepts", c.Name+".md"), c.Sources)
+	// Check promotions/demotions
+	if cfg.Compiler.AutoPromoteEnabled() {
+		if promoted, err := tierMgr.CheckPromotions(); err == nil && len(promoted) > 0 {
+			log.Info("sources eligible for promotion", "count", len(promoted))
+			for _, p := range promoted {
+				if err := itemStore.SetTier(p, 3, "auto-promote"); err != nil {
+					log.Warn("set tier failed", "path", p, "tier", 3, "error", err)
+				}
 			}
-			progress.ConceptsDiscovered(conceptNames)
-			progress.EndPhase()
-			client.TeardownCache(extCacheID)
-
-			// Pass 3: Write articles
-			if len(concepts) > 0 {
-				writeModel := cfg.Models.Write
-				if writeModel == "" {
-					writeModel = model
+		}
+	}
+	if cfg.Compiler.AutoDemoteEnabled() {
+		if demoted, err := tierMgr.CheckDemotions(); err == nil && len(demoted) > 0 {
+			log.Info("demoting stale sources", "count", len(demoted))
+			for _, p := range demoted {
+				if err := itemStore.SetTier(p, 1, "stale"); err != nil {
+					log.Warn("set tier failed", "path", p, "tier", 1, "error", err)
 				}
-				articleMaxTokens := cfg.Compiler.ArticleMaxTokens
-				if articleMaxTokens <= 0 {
-					articleMaxTokens = 4000
-				}
-
-				merged := ontology.MergedRelations(cfg.Ontology.Relations)
-				ontStore := ontology.NewStore(db, ontology.ValidRelationNames(merged))
-
-				client.SetPass("write")
-				var writeCacheID string
-				if cacheEnabled {
-					writeCacheID, _ = client.SetupCache("You are a knowledge base article writer. Write comprehensive, well-structured wiki articles.", writeModel)
-				}
-				relPatterns := ontology.RelationPatterns(merged)
-				progress.StartPhase("Pass 3: Write articles", len(concepts))
-				chunkTokens := embed.GetChunkTokens(cfg)
-				articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields, relPatterns, chunkTokens)
-
-				for _, ar := range articles {
-					if ar.Error != nil {
-						result.Errors++
-						progress.ItemError(ar.ConceptName, ar.Error)
-					} else {
-						result.ArticlesWritten++
-						progress.ItemDone(ar.ConceptName, ar.ArticlePath)
-					}
-				}
-				progress.EndPhase()
-				client.TeardownCache(writeCacheID)
 			}
 		}
 	}
@@ -425,13 +381,8 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 	// Pass 4: Image extraction (placeholder)
 	ExtractImages(projectDir, cfg.Output, toProcess)
 
-	// Handle removed sources
-	for _, removed := range diff.Removed {
-		mf.RemoveSource(removed)
-		memStore.Delete(removed)
-		vecStore.Delete(removed)
-		log.Info("removed source", "path", removed)
-	}
+	// Handle removed sources — detect orphans BEFORE removing from manifest
+	handleRemovedSources(projectDir, diff.Removed, mf, memStore, vecStore, pipelineOntStore, opts.Prune)
 
 	// Save manifest
 	if err := mf.Save(mfPath); err != nil {
@@ -441,6 +392,15 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 	// Write CHANGELOG entry
 	if err := writeChangelog(projectDir, cfg.Output, result, cfg.Compiler.UserTimeLocation()); err != nil {
 		log.Warn("failed to write CHANGELOG", "error", err)
+	}
+
+	// FTS/vector consistency check
+	if result.EmbedErrors > 0 {
+		ftsCount, _ := memStore.Count()
+		vecCount, _ := vecStore.Count()
+		if ftsCount != vecCount {
+			log.Warn("FTS/vector mismatch after compile", "fts", ftsCount, "vec", vecCount, "embed_errors", result.EmbedErrors)
+		}
 	}
 
 	// Clean up checkpoint on success
@@ -526,7 +486,7 @@ func submitBatch(
 		}
 
 		templateName := "summarize_" + content.Type
-		if _, err := prompts.Render(templateName, prompts.SummarizeData{}); err != nil {
+		if _, err := prompts.Render(templateName, prompts.SummarizeData{}, ""); err != nil {
 			templateName = "summarize_article"
 		}
 
@@ -534,7 +494,7 @@ func submitBatch(
 			SourcePath: src.Path,
 			SourceType: content.Type,
 			MaxTokens:  maxTokens,
-		})
+		}, cfg.Language)
 		if err != nil {
 			log.Warn("batch: skip source (prompt render failed)", "path", src.Path, "error", err)
 			continue
@@ -663,6 +623,7 @@ func resumeBatch(
 	memStore := memory.NewStore(db)
 	vecStore := vectors.NewStore(db)
 	embedder := embed.NewFromConfig(cfg)
+	chunkStore := memory.NewChunkStore(db)
 
 	progress := NewProgress()
 	mfPath := filepath.Join(projectDir, ".manifest.json")
@@ -719,7 +680,7 @@ func resumeBatch(
 
 		// Update manifest — ensure source entry exists, then mark compiled
 		if _, exists := mf.Sources[br.CustomID]; !exists {
-			mf.AddSource(br.CustomID, "", extractType(br.CustomID), 0)
+			mf.AddSource(br.CustomID, "", extractType(br.CustomID, cfg.TypeSignals), 0)
 		}
 		mf.MarkCompiled(br.CustomID, summaryPath, nil)
 
@@ -727,7 +688,7 @@ func resumeBatch(
 		memStore.Add(memory.Entry{
 			ID:          br.CustomID,
 			Content:     summaryText,
-			Tags:        []string{extractType(br.CustomID)},
+			Tags:        []string{extractType(br.CustomID, cfg.TypeSignals)},
 			ArticlePath: summaryPath,
 		})
 
@@ -799,13 +760,31 @@ func resumeBatch(
 				}
 
 				merged := ontology.MergedRelations(cfg.Ontology.Relations)
-				ontStore := ontology.NewStore(db, ontology.ValidRelationNames(merged))
+				mergedTypes := ontology.MergedEntityTypes(cfg.Ontology.EntityTypes)
+				ontStore := ontology.NewStore(db, ontology.ValidRelationNames(merged), ontology.ValidEntityTypeNames(mergedTypes))
 				client.SetPass("write")
 				writeCacheID, _ := client.SetupCache("You are a knowledge base article writer. Write comprehensive, well-structured wiki articles.", writeModel)
 				relPatterns := ontology.RelationPatterns(merged)
 				progress.StartPhase("Pass 3: Write articles", len(concepts))
-				chunkTokens := embed.GetChunkTokens(cfg)
-				articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields, relPatterns, chunkTokens)
+				articles := WriteArticles(ArticleWriteOpts{
+					ProjectDir:       projectDir,
+					OutputDir:        cfg.Output,
+					Client:           client,
+					Model:            writeModel,
+					MaxTokens:        articleMaxTokens,
+					MaxParallel:      cfg.Compiler.MaxParallel,
+					MemStore:         memStore,
+					VecStore:         vecStore,
+					OntStore:         ontStore,
+					ChunkStore:       chunkStore,
+					DB:               db,
+					Embedder:         embedder,
+					UserTZ:           cfg.Compiler.UserTimeLocation(),
+					ArticleFields:    cfg.Compiler.ArticleFields,
+					RelationPatterns: relPatterns,
+					ChunkSize:        cfg.Search.ChunkSizeOrDefault(),
+					Language:         cfg.Language,
+				}, concepts)
 
 				for _, ar := range articles {
 					if ar.Error != nil {
@@ -894,8 +873,26 @@ func removeFromPending(state *CompileState, path string) {
 	}
 }
 
-func extractType(path string) string {
-	return extract.DetectSourceType(path)
+func extractType(path string, typeSignals []config.TypeSignal) string {
+	var contentHead string
+	if len(typeSignals) > 0 {
+		contentHead = extract.ReadHead(path, extract.DefaultHeadRunes)
+	}
+	return extract.DetectSourceTypeWithSignals(path, contentHead, convertSignals(typeSignals))
+}
+
+func convertSignals(typeSignals []config.TypeSignal) []extract.TypeSignal {
+	signals := make([]extract.TypeSignal, len(typeSignals))
+	for i, s := range typeSignals {
+		signals[i] = extract.TypeSignal{
+			Type:             s.Type,
+			Pattern:          s.Pattern,
+			FilenameKeywords: s.FilenameKeywords,
+			ContentKeywords:  s.ContentKeywords,
+			MinContentHits:   s.MinContentHits,
+		}
+	}
+	return signals
 }
 
 // timeNow returns the current time in RFC3339 using the given timezone.
@@ -912,6 +909,57 @@ func filterSuccessful(summaries []SummaryResult) []SummaryResult {
 		}
 	}
 	return result
+}
+
+// handleRemovedSources processes removed source files, detecting orphaned articles
+// and optionally pruning them. Must be called BEFORE mf.RemoveSource() since it
+// needs the manifest entries to look up affected concepts.
+func handleRemovedSources(projectDir string, removed []string, mf *manifest.Manifest,
+	memStore *memory.Store, vecStore *vectors.Store, ontStore *ontology.Store, prune bool) {
+
+	for _, removedPath := range removed {
+		affectedConcepts := mf.ArticlesFromSource(removedPath)
+		for _, conceptName := range affectedConcepts {
+			concept, ok := mf.Concepts[conceptName]
+			if !ok {
+				continue
+			}
+			if len(concept.Sources) <= 1 {
+				log.Warn("article orphaned (sole source removed)",
+					"concept", conceptName,
+					"article", concept.ArticlePath,
+					"source", removedPath)
+				if prune {
+					articleAbs := filepath.Join(projectDir, concept.ArticlePath)
+					if err := os.Remove(articleAbs); err != nil && !os.IsNotExist(err) {
+						log.Warn("failed to delete orphaned article", "path", articleAbs, "error", err)
+					} else {
+						log.Info("pruned orphaned article", "concept", conceptName, "path", concept.ArticlePath)
+					}
+					memStore.Delete("concept:" + conceptName)
+					vecStore.Delete("concept:" + conceptName)
+					ontStore.DeleteEntity(conceptName)
+					delete(mf.Concepts, conceptName)
+				}
+			} else {
+				var updated []string
+				for _, s := range concept.Sources {
+					if s != removedPath {
+						updated = append(updated, s)
+					}
+				}
+				concept.Sources = updated
+				mf.Concepts[conceptName] = concept
+				log.Info("updated concept sources (removed source)",
+					"concept", conceptName, "remaining_sources", len(updated))
+			}
+		}
+
+		mf.RemoveSource(removedPath)
+		memStore.Delete(removedPath)
+		vecStore.Delete(removedPath)
+		log.Info("removed source", "path", removedPath)
+	}
 }
 
 func writeChangelog(projectDir string, outputDir string, result *CompileResult, loc *time.Location) error {

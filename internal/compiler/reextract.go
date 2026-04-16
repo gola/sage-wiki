@@ -10,9 +10,9 @@ import (
 	"github.com/xoai/sage-wiki/internal/llm"
 	"github.com/xoai/sage-wiki/internal/log"
 	"github.com/xoai/sage-wiki/internal/manifest"
+	"github.com/xoai/sage-wiki/internal/prompts"
 	"github.com/xoai/sage-wiki/internal/memory"
 	"github.com/xoai/sage-wiki/internal/ontology"
-	"github.com/xoai/sage-wiki/internal/prompts"
 	"github.com/xoai/sage-wiki/internal/storage"
 	"github.com/xoai/sage-wiki/internal/vectors"
 )
@@ -67,7 +67,7 @@ func ReExtract(projectDir string) (*CompileResult, error) {
 	}
 
 	// Create LLM client
-	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit, cfg.API.TimeoutSeconds)
+	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit, llm.WithExtraParams(cfg.API.ExtraParams), llm.WithTimeout(cfg.API.TimeoutSeconds))
 	if err != nil {
 		return nil, fmt.Errorf("re-extract: create LLM client: %w", err)
 	}
@@ -81,9 +81,11 @@ func ReExtract(projectDir string) (*CompileResult, error) {
 
 	memStore := memory.NewStore(db)
 	vecStore := vectors.NewStore(db)
-	merged := ontology.MergedRelations(cfg.Ontology.Relations)
-	ontStore := ontology.NewStore(db, ontology.ValidRelationNames(merged))
+	mergedRels := ontology.MergedRelations(cfg.Ontology.Relations)
+	mergedTypes := ontology.MergedEntityTypes(cfg.Ontology.EntityTypes)
+	ontStore := ontology.NewStore(db, ontology.ValidRelationNames(mergedRels), ontology.ValidEntityTypeNames(mergedTypes))
 	embedder := embed.NewFromConfig(cfg)
+	chunkStore := memory.NewChunkStore(db)
 
 	// Pass 2: Concept extraction
 	extractModel := cfg.Models.Extract
@@ -114,10 +116,27 @@ func ReExtract(projectDir string) (*CompileResult, error) {
 			articleMaxTokens = 4000
 		}
 
-		relPatterns := ontology.RelationPatterns(merged)
+		relPatterns := ontology.RelationPatterns(mergedRels)
 		log.Info("Pass 3: writing articles", "concepts", len(concepts))
-		chunkTokens := embed.GetChunkTokens(cfg)
-		articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields, relPatterns, chunkTokens)
+		articles := WriteArticles(ArticleWriteOpts{
+			ProjectDir:       projectDir,
+			OutputDir:        cfg.Output,
+			Client:           client,
+			Model:            writeModel,
+			MaxTokens:        articleMaxTokens,
+			MaxParallel:      cfg.Compiler.MaxParallel,
+			MemStore:         memStore,
+			VecStore:         vecStore,
+			OntStore:         ontStore,
+			ChunkStore:       chunkStore,
+			DB:               db,
+			Embedder:         embedder,
+			UserTZ:           cfg.Compiler.UserTimeLocation(),
+			ArticleFields:    cfg.Compiler.ArticleFields,
+			RelationPatterns: relPatterns,
+			ChunkSize:        cfg.Search.ChunkSizeOrDefault(),
+			Language:         cfg.Language,
+		}, concepts)
 
 		for _, ar := range articles {
 			if ar.Error != nil {
@@ -165,7 +184,6 @@ func ReWrite(projectDir string) (*CompileResult, error) {
 	}
 
 	// Filter to only concepts that need re-writing (article file doesn't exist)
-	// manifest.Concepts is a map[string]Concept, key is the concept name
 	var conceptsToWrite []string
 	for name := range concepts {
 		articlePath := filepath.Join(projectDir, cfg.Output, "concepts", name+".md")
@@ -182,7 +200,7 @@ func ReWrite(projectDir string) (*CompileResult, error) {
 	log.Info("re-write: found concepts needing articles", "count", len(conceptsToWrite))
 
 	// Create LLM client
-	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit, cfg.API.TimeoutSeconds)
+	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit, llm.WithExtraParams(cfg.API.ExtraParams), llm.WithTimeout(cfg.API.TimeoutSeconds))
 	if err != nil {
 		return nil, fmt.Errorf("re-write: create LLM client: %w", err)
 	}
@@ -196,9 +214,11 @@ func ReWrite(projectDir string) (*CompileResult, error) {
 
 	memStore := memory.NewStore(db)
 	vecStore := vectors.NewStore(db)
-	merged := ontology.MergedRelations(cfg.Ontology.Relations)
-	ontStore := ontology.NewStore(db, ontology.ValidRelationNames(merged))
+	mergedRels := ontology.MergedRelations(cfg.Ontology.Relations)
+	mergedTypes := ontology.MergedEntityTypes(cfg.Ontology.EntityTypes)
+	ontStore := ontology.NewStore(db, ontology.ValidRelationNames(mergedRels), ontology.ValidEntityTypeNames(mergedTypes))
 	embedder := embed.NewFromConfig(cfg)
+	chunkStore := memory.NewChunkStore(db)
 
 	// Convert concept names to ExtractedConcept
 	extractedConcepts := make([]ExtractedConcept, len(conceptsToWrite))
@@ -220,10 +240,27 @@ func ReWrite(projectDir string) (*CompileResult, error) {
 		articleMaxTokens = 4000
 	}
 
-	relPatterns := ontology.RelationPatterns(merged)
+	relPatterns := ontology.RelationPatterns(mergedRels)
 	log.Info("re-write: writing missing articles", "concepts", len(extractedConcepts))
-	chunkTokens := embed.GetChunkTokens(cfg)
-	articles := WriteArticles(projectDir, cfg.Output, extractedConcepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields, relPatterns, chunkTokens)
+	articles := WriteArticles(ArticleWriteOpts{
+		ProjectDir:       projectDir,
+		OutputDir:        cfg.Output,
+		Client:           client,
+		Model:            writeModel,
+		MaxTokens:        articleMaxTokens,
+		MaxParallel:      cfg.Compiler.MaxParallel,
+		MemStore:         memStore,
+		VecStore:         vecStore,
+		OntStore:         ontStore,
+		ChunkStore:       chunkStore,
+		DB:               db,
+		Embedder:         embedder,
+		UserTZ:           cfg.Compiler.UserTimeLocation(),
+		ArticleFields:    cfg.Compiler.ArticleFields,
+		RelationPatterns: relPatterns,
+		ChunkSize:        cfg.Search.ChunkSizeOrDefault(),
+		Language:         cfg.Language,
+	}, extractedConcepts)
 
 	for _, ar := range articles {
 		if ar.Error != nil {

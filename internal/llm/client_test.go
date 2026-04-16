@@ -223,6 +223,22 @@ func TestBackoffDelay(t *testing.T) {
 	}
 }
 
+func TestIsRetryable(t *testing.T) {
+	retryable := []int{429, 500, 502, 503}
+	for _, code := range retryable {
+		if !isRetryable(code) {
+			t.Errorf("expected %d to be retryable", code)
+		}
+	}
+
+	notRetryable := []int{200, 400, 401, 403, 404, 422}
+	for _, code := range notRetryable {
+		if isRetryable(code) {
+			t.Errorf("expected %d to NOT be retryable", code)
+		}
+	}
+}
+
 func TestOllamaUsesOpenAIFormat(t *testing.T) {
 	client, err := NewClient("ollama", "", "", 0, 0)
 	if err != nil {
@@ -244,8 +260,16 @@ func TestStripThinkTags(t *testing.T) {
 		{"multiline tag", "<think>\nstep 1\nstep 2\n</think>\nResult", "Result"},
 		{"tag with trailing whitespace", "<think>internal</think>  \n\nContent here", "Content here"},
 		{"multiple tags", "<think>first</think>A<think>second</think>B", "AB"},
-		{"empty after strip", "<think>only reasoning</think>", ""},
 		{"no think tags just content", "plain text without tags", "plain text without tags"},
+		// Fallback: when strip produces empty, extract think content
+		{"fallback single think", "<think>only reasoning</think>", "only reasoning"},
+		{"fallback with whitespace", "<think>  content  </think>   ", "content"},
+		{"fallback multiline think", "<think>\nline 1\nline 2\n</think>", "line 1\nline 2"},
+		{"fallback first of multiple", "<think>first</think><think>second</think>", "first"},
+		// Edge cases
+		{"empty string", "", ""},
+		{"just whitespace", "   ", ""},
+		{"nested angle brackets", "<think>a<b>c</b>d</think>Real", "Real"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -286,5 +310,49 @@ func TestChatCompletionStripsThinkTags(t *testing.T) {
 	}
 	if resp.Content != "The answer is 42." {
 		t.Errorf("unexpected content: %q", resp.Content)
+	}
+}
+
+func TestExtraParamsMergedIntoRequest(t *testing.T) {
+	var receivedBody map[string]interface{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&receivedBody)
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{
+				{"message": map[string]string{"content": "ok"}},
+			},
+			"model": "test",
+			"usage": map[string]int{"total_tokens": 10},
+		})
+	}))
+	defer server.Close()
+
+	extra := map[string]interface{}{
+		"enable_thinking": false,
+		"top_k":           40,
+	}
+	client, err := NewClient("openai", "test-key", server.URL, 1000, extra)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	_, err = client.ChatCompletion([]Message{
+		{Role: "user", Content: "test"},
+	}, CallOpts{Model: "test-model"})
+	if err != nil {
+		t.Fatalf("ChatCompletion: %v", err)
+	}
+
+	// Verify extra params were merged
+	if val, ok := receivedBody["enable_thinking"]; !ok || val != false {
+		t.Errorf("enable_thinking = %v, want false", val)
+	}
+	if val, ok := receivedBody["top_k"]; !ok || val != float64(40) {
+		t.Errorf("top_k = %v, want 40", val)
+	}
+	// Standard fields should still be present
+	if receivedBody["model"] != "test-model" {
+		t.Errorf("model = %v, want test-model", receivedBody["model"])
 	}
 }

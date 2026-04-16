@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -18,7 +17,16 @@ import (
 // Watch monitors source directories for changes and triggers compilation.
 // It tries fsnotify first, then falls back to polling if no events are
 // received (common on WSL2 /mnt/ paths and network drives).
-func Watch(projectDir string, debounceSeconds int) error {
+// If coordinator is non-nil, it is used to serialize compiles with on-demand
+// requests. If nil, a local coordinator is created.
+func Watch(projectDir string, debounceSeconds int, coordinator ...*CompileCoordinator) error {
+	var cc *CompileCoordinator
+	if len(coordinator) > 0 && coordinator[0] != nil {
+		cc = coordinator[0]
+	} else {
+		cc = NewCompileCoordinator()
+	}
+	_ = cc // used below
 	if debounceSeconds <= 0 {
 		debounceSeconds = 2
 	}
@@ -72,19 +80,18 @@ func Watch(projectDir string, debounceSeconds int) error {
 			watcher.Close()
 		}
 		log.Info("using polling mode (inotify unavailable for these paths)", "sources", sourcePaths, "interval", fmt.Sprintf("%ds", debounceSeconds*2))
-		return watchPoll(projectDir, sourcePaths, cfg.Ignore, debounceSeconds*2)
+		return watchPoll(projectDir, sourcePaths, cfg.Ignore, debounceSeconds*2, cc)
 	}
 
 	defer watcher.Close()
 	log.Info("watching for changes (fsnotify)", "sources", sourcePaths, "debounce", debounceSeconds)
-	return watchFsnotify(projectDir, watcher, debounceSeconds)
+	return watchFsnotify(projectDir, watcher, debounceSeconds, cc)
 }
 
 // watchFsnotify uses inotify-based watching (works on native Linux, macOS).
-func watchFsnotify(projectDir string, watcher *fsnotify.Watcher, debounceSeconds int) error {
+func watchFsnotify(projectDir string, watcher *fsnotify.Watcher, debounceSeconds int, cc *CompileCoordinator) error {
 	debounce := time.Duration(debounceSeconds) * time.Second
 	var timer *time.Timer
-	var compileMu sync.Mutex
 	var lastTrigger string
 
 	for {
@@ -113,7 +120,7 @@ func watchFsnotify(projectDir string, watcher *fsnotify.Watcher, debounceSeconds
 			}
 			trigger := lastTrigger
 			timer = time.AfterFunc(debounce, func() {
-				triggerCompile(projectDir, trigger, &compileMu)
+				triggerCompile(projectDir, trigger, cc)
 			})
 
 		case err, ok := <-watcher.Errors:
@@ -127,8 +134,7 @@ func watchFsnotify(projectDir string, watcher *fsnotify.Watcher, debounceSeconds
 
 // watchPoll periodically scans source directories for changes.
 // Works on WSL2 /mnt/ paths, network drives, and any filesystem.
-func watchPoll(projectDir string, sourcePaths []string, ignore []string, intervalSeconds int) error {
-	var compileMu sync.Mutex
+func watchPoll(projectDir string, sourcePaths []string, ignore []string, intervalSeconds int, cc *CompileCoordinator) error {
 
 	// Build initial snapshot
 	snapshot := scanSnapshot(sourcePaths, ignore)
@@ -166,7 +172,7 @@ func watchPoll(projectDir string, sourcePaths []string, ignore []string, interva
 
 		if len(changed) > 0 {
 			log.Info("changes detected", "count", len(changed))
-			triggerCompile(projectDir, changed[0], &compileMu)
+			triggerCompile(projectDir, changed[0], cc)
 		}
 	}
 
@@ -183,11 +189,13 @@ func scanSnapshot(sourcePaths []string, ignore []string) map[string]string {
 				return nil
 			}
 
-			// Check ignore list
-			for _, ign := range ignore {
-				if strings.Contains(path, ign) {
-					return nil
-				}
+			// Use relative path for consistent ignore matching with Diff
+			relPath, relErr := filepath.Rel(dir, path)
+			if relErr != nil {
+				relPath = path
+			}
+			if isIgnored(relPath, ignore) {
+				return nil
 			}
 
 			hash := quickHash(path)
@@ -224,23 +232,26 @@ func fullHash(path string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-func triggerCompile(projectDir string, trigger string, compileMu *sync.Mutex) {
-	if !compileMu.TryLock() {
-		log.Info("compile already in progress, skipping", "trigger", trigger)
-		return
-	}
-	defer compileMu.Unlock()
-
-	log.Info("compiling after change", "trigger", trigger)
-	result, err := Compile(projectDir, CompileOpts{})
-	if err != nil {
-		log.Error("compile failed", "error", err)
-	} else {
+func triggerCompile(projectDir string, trigger string, cc *CompileCoordinator) {
+	ok, err := cc.TryCompile(func() error {
+		log.Info("compiling after change", "trigger", trigger)
+		result, err := Compile(projectDir, CompileOpts{})
+		if err != nil {
+			log.Error("compile failed", "error", err)
+			return err
+		}
 		log.Info("compile complete",
 			"summarized", result.Summarized,
 			"concepts", result.ConceptsExtracted,
 			"articles", result.ArticlesWritten,
 		)
+		return nil
+	})
+	if !ok {
+		log.Info("compile already in progress, skipping", "trigger", trigger)
+	}
+	if err != nil {
+		log.Error("triggered compile error", "error", err)
 	}
 }
 

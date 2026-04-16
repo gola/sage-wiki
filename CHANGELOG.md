@@ -1,5 +1,174 @@
 # Changelog
 
+## 0.1.4 — 2026-04-15
+
+### Large Vault Performance
+
+Architecture shift from "compile everything" to "index fast, compile what matters" for vaults of 10K-100K+ documents. 9 milestones across 4 phases, 4 independent code reviews passed.
+
+#### Tiered Compilation
+
+- **4-tier system** — Tier 0 (FTS5 index, ~5ms, free), Tier 1 (+ vector embed, ~200ms), Tier 2 (code parse, ~10ms, free), Tier 3 (full LLM compile, ~5-8 min). A 100K vault is searchable at Tier 1 in ~5.5 hours instead of 555 days.
+- **File-type-aware defaults** — JSON/YAML/TOML/lock → Tier 0, prose/code → Tier 1. Configurable via `compiler.tier_defaults`.
+- **Per-file overrides** — `.wikitier` files per directory and `tier:` frontmatter field. Priority: frontmatter > .wikitier > tier_defaults > default_tier.
+- **Auto-promotion** — Sources promote to Tier 3 after 3+ search hits or when topic cluster reaches 5+ sources. Configurable via `compiler.promote_signals`.
+- **Auto-demotion** — Stale articles (90 days without queries) demote to Tier 1. Modified sources revert for recompilation. Configurable via `compiler.demote_signals`.
+- **compile_items table** — New SQLite migration V5 with per-source tier, 6 pass-completion flags, promotion/demotion timestamps, quality metrics, and 5 indexes. Replaces JSON `compile-state.json` for checkpoint/resume.
+- **Checkpoint migration** — Existing `compile-state.json` auto-migrates to `compile_items` on first compile. Batch-in-flight checkpoints preserved.
+
+#### Compile-on-Demand
+
+- **`wiki_compile_topic` MCP tool** — Agents trigger compilation for specific topics. Searches for uncompiled sources, promotes to Tier 3, runs full pipeline. ~2 min for 20 sources.
+- **Search response signaling** — `wiki_search` now returns `uncompiled_sources` count and `compile_hint` in every response. Agents know when richer results are available.
+- **CompileCoordinator** — Serializes background (watch mode) and on-demand compiles via shared mutex with `TryCompile` (non-blocking) and `CompileOrWait` (context-aware timeout).
+
+#### Adaptive Backpressure
+
+- **Default `max_parallel` 4→20** — Safe for all paid API tiers.
+- **BackpressureController** — Replaces fixed semaphore. Halves concurrency on 429s with exponential backoff + jitter. Doubles back after 5 consecutive successes. Self-tunes to any provider's rate limits at runtime.
+- **RateLimitError type** — LLM client detects HTTP 429 across all providers and returns typed error for backpressure integration.
+
+#### Code Parsers
+
+- **10 built-in parsers** — Go (via `go/parser` + `go/ast`, perfect accuracy), TypeScript/JavaScript, Python, Rust, Java, C/C++, Ruby (via regex, ~90% coverage), JSON/YAML/TOML (key extraction).
+- **Pluggable `Parser` interface** — `internal/extract/parsers/` package with Registry. Future tree-sitter WASM upgrade path.
+- **Pipeline integration** — Structural summaries appended to FTS5 entries at Tier 0/1. Code searchable by function name, type, import path.
+
+#### Document Splitting
+
+- **`SplitByHeadings()`** — Splits large documents (>15K chars) at markdown heading boundaries for the write pass. Reduces context per LLM call by 3-4x.
+- **Section-aware article writing** — `buildSourceContext()` selects only sections relevant to each concept via term matching. 4K char cap per source.
+
+#### Quality Scoring
+
+- **Per-article confidence** — Source coverage (40%), extraction completeness (30%), cross-reference density (30%). Stored in `compile_items.quality_score`.
+- **QualityPass in linter** — `sage-wiki lint` flags articles below quality threshold (default 0.5). Reports tier distribution and compilation error count.
+- **`source_type` tracking** — Distinguishes compiler/scribe/manual ingestion paths in compile_items.
+
+#### Concept Deduplication
+
+- **Embedding-based dedup cache** — Cosine similarity check before article writing (threshold 0.85). Near-duplicate concepts merge as aliases. Capped at 50K entries, loads existing vectors from store (no re-embedding on seed).
+
+#### Session Scribe
+
+- **Scribe interface** — `internal/scribe/` package with pluggable `Scribe` interface (Name, Process → Result). Extensible for future git-commit and issue-tracker scribes.
+- **Session scribe** — Processes Claude Code JSONL transcripts: compress (strip thinking blocks, ~99% reduction) → extract entities via LLM (max 10/session, kebab-case ID gate) → compare against ontology (ADD/UPDATE/NONE disposition). Handles both string and array-of-blocks content formats.
+- **`sage-wiki scribe <file>`** — New CLI command for session entity extraction.
+
+#### Batch API Default
+
+- **`mode: auto`** is now the default. Automatically uses batch API (50% cost savings) when 10+ sources are pending and the provider supports it.
+
+### New Config Fields
+
+```yaml
+compiler:
+  max_parallel: 20              # adaptive backpressure (was 4)
+  mode: auto                    # standard, batch, or auto
+  default_tier: 1               # 0=index, 1=embed, 3=compile
+  tier_defaults:                # per-extension tier overrides
+    json: 0
+    yaml: 0
+    md: 1
+    go: 1
+  auto_promote: true
+  promote_signals:
+    query_hit_count: 3
+    cluster_size: 5
+    import_centrality: 10
+  auto_demote: true
+  demote_signals:
+    source_modified: true
+    stale_days: 90
+  split_threshold: 15000        # chars, for document splitting
+  backpressure: true
+  dedup_threshold: 0.85         # cosine similarity for concept dedup
+```
+
+### New Commands
+
+- `sage-wiki scribe <session-file>` — Extract entities from session transcripts
+
+### New MCP Tools
+
+- `wiki_compile_topic(topic, max_sources?)` — Compile sources for a specific topic on demand
+
+### Documentation
+
+- **[Scaling guide](docs/guides/large-vault-performance.md)** — Comprehensive guide covering tiers, config, on-demand compilation, backpressure, code parsers, quality scoring, cost estimation, and recommended workflow for large vaults.
+- **[Local models guide](docs/guides/local-models.md)** — Per-pass model routing, GPU/CPU/mixed configurations, quality trade-offs, Ollama setup.
+
+### Stats
+
+- 27 packages, 0 failures
+- 64 files changed, 7,708 insertions
+- 4 ADRs (023-026)
+- 4 independent code reviews passed
+
+### Binaries
+
+| Platform                    | Binary                        | Size  |
+| --------------------------- | ----------------------------- | ----- |
+| Linux amd64                 | `sage-wiki-linux-amd64`       | 33 MB |
+| Linux arm64                 | `sage-wiki-linux-arm64`       | 31 MB |
+| macOS amd64 (Intel)         | `sage-wiki-darwin-amd64`      | 34 MB |
+| macOS arm64 (Apple Silicon) | `sage-wiki-darwin-arm64`      | 33 MB |
+| Windows amd64               | `sage-wiki-windows-amd64.exe` | 34 MB |
+| Windows arm64               | `sage-wiki-windows-arm64.exe` | 32 MB |
+
+### Docker
+
+```bash
+docker pull ghcr.io/xoai/sage-wiki:v0.1.4
+docker pull xoai/sage-wiki:v0.1.4
+```
+
+---
+
+## 0.1.3 — 2026-04-11
+
+### Graph-Enhanced Retrieval
+
+- **4-signal graph relevance scorer** — New `internal/graph/` package scores candidate articles using four signals: direct ontology relations (×3.0), shared source documents via `cites` edges (×4.0), Adamic-Adar common neighbors (×1.5), and entity type affinity (×1.0). Uses only the SQLite ontology store — no manifest loading at query time.
+- **Graph-expanded context** — After hybrid search, the graph scorer finds related articles missed by keyword/vector search and adds them to the LLM synthesis context. Applied as post-processing in `buildQueryContext()` so both enhanced (chunk-level) and document-level search paths benefit.
+- **Token budget control** — Query context capped at configurable `context_max_tokens` (default 8000). Articles truncated at 4000 tokens each (chars/4 estimation). Greedy filling from highest-scored down.
+
+### Source Provenance
+
+- **CLI `sage-wiki provenance`** — Given a source path, shows all generated articles. Given a concept name, shows contributing sources. Auto-detects direction.
+- **MCP `wiki_provenance` tool** — Parameters: `source` or `article`. Returns JSON provenance mapping. Registered in read tools and CallTool dispatch.
+- **Web API `GET /api/provenance`** — Query params `?source=path` or `?article=name`. Loads manifest from disk for each request.
+- **Manifest helpers** — `ArticlesFromSource(path)` reverse-lookup (O(n) scan, fine for typical wikis) and `SourcesForArticle(name)` direct lookup.
+
+### Cascade Awareness
+
+- **Orphan detection on source removal** — When a source is removed during compile, affected concepts are identified _before_ the manifest entry is deleted. Single-source concepts are flagged as orphaned with a log warning. Multi-source concepts get their sources list updated.
+- **`--prune` flag** — Opt-in destructive cleanup: `sage-wiki compile --prune` deletes orphaned article files, removes FTS5/vector/ontology entries, and cleans up the manifest. Warn-only by default.
+
+### Ontology Helpers
+
+- **`EntityDegree(id)`** — Returns total relation count (inbound + outbound) for an entity. Used by Adamic-Adar scoring.
+- **`EntitiesCiting(targetID)`** — Reverse `cites` lookup: finds all concepts that cite a source entity.
+- **`CitedBy(entityID)`** — Forward `cites` lookup: finds all source entities that a concept cites.
+
+### New Config Fields
+
+```yaml
+search:
+  graph_expansion: true # enable graph-based context expansion (default: true)
+  graph_max_expand: 10 # max articles added via graph
+  graph_depth: 2 # ontology traversal depth
+  context_max_tokens: 8000 # token budget for query context
+  weight_direct_link: 3.0 # graph signal weights
+  weight_source_overlap: 4.0
+  weight_common_neighbor: 1.5
+  weight_type_affinity: 1.0
+```
+
+All fields optional with sensible defaults. `graph_expansion` uses `*bool` pattern (like `query_expansion`, `rerank`) — nil defaults to true. Existing configs work unchanged.
+
+---
+
 ## 0.1.2 — 2026-04-10
 
 ### Docker & Self-Hosting
@@ -22,9 +191,9 @@
 ontology:
   relations:
     - name: implements
-      synonyms: ["thực hiện", "triển khai"]   # extend built-in with multilingual synonyms
+      synonyms: ["thực hiện", "triển khai"] # extend built-in with multilingual synonyms
     - name: regulates
-      synonyms: ["regulates", "regulated by"]  # add a custom relation type
+      synonyms: ["regulates", "regulated by"] # add a custom relation type
 ```
 
 ### Fixes
@@ -45,14 +214,14 @@ ontology:
 
 ### Binaries
 
-| Platform | Binary |
-|----------|--------|
-| Linux amd64 | `sage-wiki-linux-amd64` |
-| Linux arm64 | `sage-wiki-linux-arm64` |
-| macOS amd64 (Intel) | `sage-wiki-darwin-amd64` |
-| macOS arm64 (Apple Silicon) | `sage-wiki-darwin-arm64` |
-| Windows amd64 | `sage-wiki-windows-amd64.exe` |
-| Windows arm64 | `sage-wiki-windows-arm64.exe` |
+| Platform                    | Binary                        |
+| --------------------------- | ----------------------------- |
+| Linux amd64                 | `sage-wiki-linux-amd64`       |
+| Linux arm64                 | `sage-wiki-linux-arm64`       |
+| macOS amd64 (Intel)         | `sage-wiki-darwin-amd64`      |
+| macOS arm64 (Apple Silicon) | `sage-wiki-darwin-arm64`      |
+| Windows amd64               | `sage-wiki-windows-amd64.exe` |
+| Windows arm64               | `sage-wiki-windows-arm64.exe` |
 
 ### Docker
 
@@ -89,11 +258,11 @@ docker pull xoai/sage-wiki:v0.1.2
 
 ```yaml
 compiler:
-  mode: standard          # standard, batch, or auto
-  estimate_before: false  # prompt before compiling
-  prompt_cache: true      # enable prompt caching (default: true)
-  batch_threshold: 10     # min sources for auto-batch
-  token_price_per_million: 0  # override pricing (0 = use built-in)
+  mode: standard # standard, batch, or auto
+  estimate_before: false # prompt before compiling
+  prompt_cache: true # enable prompt caching (default: true)
+  batch_threshold: 10 # min sources for auto-batch
+  token_price_per_million: 0 # override pricing (0 = use built-in)
 ```
 
 ### New CLI Flags
@@ -178,11 +347,11 @@ First public release of sage-wiki, an LLM-compiled personal knowledge base.
 
 ### Binaries
 
-| Platform | Binary |
-|----------|--------|
-| Linux amd64 | `sage-wiki-linux-amd64` |
-| Linux arm64 | `sage-wiki-linux-arm64` |
-| macOS amd64 (Intel) | `sage-wiki-darwin-amd64` |
-| macOS arm64 (Apple Silicon) | `sage-wiki-darwin-arm64` |
-| Windows amd64 | `sage-wiki-windows-amd64.exe` |
-| Windows arm64 | `sage-wiki-windows-arm64.exe` |
+| Platform                    | Binary                        |
+| --------------------------- | ----------------------------- |
+| Linux amd64                 | `sage-wiki-linux-amd64`       |
+| Linux arm64                 | `sage-wiki-linux-arm64`       |
+| macOS amd64 (Intel)         | `sage-wiki-darwin-amd64`      |
+| macOS arm64 (Apple Silicon) | `sage-wiki-darwin-arm64`      |
+| Windows amd64               | `sage-wiki-windows-amd64.exe` |
+| Windows arm64               | `sage-wiki-windows-arm64.exe` |

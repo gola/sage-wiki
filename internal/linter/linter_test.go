@@ -16,10 +16,11 @@ func setupLintProject(t *testing.T) (string, *LintContext) {
 	wiki.InitGreenfield(dir, "test", "gemini-2.5-flash")
 
 	ctx := &LintContext{
-		ProjectDir:     dir,
-		OutputDir:      "wiki",
-		DBPath:         filepath.Join(dir, ".sage", "wiki.db"),
-		ValidRelations: ontology.ValidRelationNames(ontology.BuiltinRelations),
+		ProjectDir:       dir,
+		OutputDir:        "wiki",
+		DBPath:           filepath.Join(dir, ".sage", "wiki.db"),
+		ValidRelations:   ontology.ValidRelationNames(ontology.BuiltinRelations),
+		ValidEntityTypes: ontology.ValidEntityTypeNames(ontology.BuiltinEntityTypes),
 	}
 	return dir, ctx
 }
@@ -147,8 +148,8 @@ func TestRunnerAllPasses(t *testing.T) {
 	}
 
 	// Should have results for all passes (even if empty)
-	if len(results) != 7 {
-		t.Errorf("expected 7 pass results, got %d", len(results))
+	if len(results) != 8 {
+		t.Errorf("expected 8 pass results, got %d", len(results))
 	}
 }
 

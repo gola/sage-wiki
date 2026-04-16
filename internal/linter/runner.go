@@ -37,11 +37,12 @@ type LintPass interface {
 
 // LintContext provides access to project data for lint passes.
 type LintContext struct {
-	ProjectDir     string
-	OutputDir      string
-	DBPath         string
-	DB             *storage.DB // shared DB connection (optional — opened from DBPath if nil)
-	ValidRelations []string    // valid ontology relation type names
+	ProjectDir       string
+	OutputDir        string
+	DBPath           string
+	DB               *storage.DB // shared DB connection (optional — opened from DBPath if nil)
+	ValidRelations   []string    // valid ontology relation type names
+	ValidEntityTypes []string    // valid ontology entity type names
 }
 
 // LintResult holds the aggregated output of a lint run.
@@ -67,6 +68,7 @@ func NewRunner() *Runner {
 			&ConnectionsPass{},
 			&ImputePass{},
 			&StalenessPass{},
+			&QualityPass{},
 		},
 	}
 }

@@ -54,6 +54,11 @@ func Diff(projectDir string, cfg *config.Config, mf *manifest.Manifest) (*DiffRe
 				return nil
 			}
 
+			// Skip hidden files (.DS_Store etc.)
+			if strings.HasPrefix(d.Name(), ".") {
+				return nil
+			}
+
 			// Get relative path from project root
 			relPath, _ := filepath.Rel(projectDir, path)
 
@@ -79,10 +84,22 @@ func Diff(projectDir string, cfg *config.Config, mf *manifest.Manifest) (*DiffRe
 				return nil
 			}
 
+			var detectedType string
+			if len(cfg.TypeSignals) > 0 {
+				// Reuse cached type from manifest if file is unchanged
+				if existing, ok := mf.Sources[relPath]; ok && existing.Hash == hash && existing.Type != "" {
+					detectedType = existing.Type
+				} else {
+					contentHead := extract.ReadHead(path, extract.DefaultHeadRunes)
+					detectedType = extract.DetectSourceTypeWithSignals(path, contentHead, convertSignals(cfg.TypeSignals))
+				}
+			} else {
+				detectedType = extract.DetectSourceType(path)
+			}
 			current[relPath] = SourceInfo{
 				Path: relPath,
 				Hash: hash,
-				Type: extract.DetectSourceType(path),
+				Type: detectedType,
 				Size: info.Size(),
 			}
 			return nil
@@ -134,13 +151,31 @@ func fileHash(path string) (string, error) {
 }
 
 // isIgnored checks if a path matches any ignore pattern.
+// Supports: folder names anywhere in path (e.g. "assets"), glob extensions (e.g. "*.png"),
+// and prefix matching (e.g. "_wiki").
 func isIgnored(relPath string, ignore []string) bool {
 	for _, pattern := range ignore {
-		// Match if path starts with ignore pattern (folder match)
+		// Glob extension pattern (e.g. "*.png")
+		if strings.HasPrefix(pattern, "*.") {
+			ext := pattern[1:] // ".png"
+			if strings.HasSuffix(strings.ToLower(relPath), strings.ToLower(ext)) {
+				return true
+			}
+			continue
+		}
+		// Prefix match (original behavior)
 		if strings.HasPrefix(relPath, pattern+"/") || strings.HasPrefix(relPath, pattern+"\\") {
 			return true
 		}
 		if relPath == pattern {
+			return true
+		}
+		// Match folder name anywhere in path (e.g. "assets" matches "raw/x/assets/y.png")
+		if strings.Contains(relPath, "/"+pattern+"/") || strings.Contains(relPath, "\\"+pattern+"\\") {
+			return true
+		}
+		// Also match trailing segment (e.g. path ends with "/assets")
+		if strings.HasSuffix(relPath, "/"+pattern) || strings.HasSuffix(relPath, "\\"+pattern) {
 			return true
 		}
 	}

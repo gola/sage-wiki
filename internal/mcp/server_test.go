@@ -63,13 +63,17 @@ func TestHandleSearch(t *testing.T) {
 		t.Errorf("unexpected error: %s", result.Content[0].(mcp.TextContent).Text)
 	}
 
-	// Parse results
+	// Parse results (wrapped in searchResponse object)
 	text := result.Content[0].(mcp.TextContent).Text
-	var results []map[string]any
-	if err := json.Unmarshal([]byte(text), &results); err != nil {
+	var resp struct {
+		Results           []map[string]any `json:"results"`
+		UncompiledSources int              `json:"uncompiled_sources"`
+		CompileHint       string           `json:"compile_hint"`
+	}
+	if err := json.Unmarshal([]byte(text), &resp); err != nil {
 		t.Fatalf("parse results: %v", err)
 	}
-	if len(results) == 0 {
+	if len(resp.Results) == 0 {
 		t.Error("expected search results")
 	}
 }

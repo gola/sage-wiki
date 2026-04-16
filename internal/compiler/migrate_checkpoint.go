@@ -1,0 +1,197 @@
+package compiler
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/xoai/sage-wiki/internal/config"
+	"github.com/xoai/sage-wiki/internal/log"
+	"github.com/xoai/sage-wiki/internal/manifest"
+	"github.com/xoai/sage-wiki/internal/storage"
+)
+
+// MigrateCheckpoint migrates compile-state.json into compile_items table.
+// It reads the existing JSON checkpoint, populates compile_items with state
+// from both the checkpoint and the manifest, then deletes the JSON file.
+//
+// If a batch is in flight (state.Batch != nil), the migration is skipped —
+// the batch must be completed first via the existing batch resume logic.
+//
+// Returns true if migration was performed, false if skipped or not needed.
+func MigrateCheckpoint(projectDir string, db *storage.DB, mf *manifest.Manifest, cfg *config.Config) (bool, error) {
+	statePath := filepath.Join(projectDir, ".sage", "compile-state.json")
+	state, err := loadCompileState(statePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil // no checkpoint to migrate
+		}
+		return false, err
+	}
+
+	// Don't migrate if a batch is in flight — must complete first
+	if state.Batch != nil {
+		log.Info("checkpoint has in-flight batch, skipping migration",
+			"batch_id", state.Batch.BatchID, "provider", state.Batch.Provider)
+		return false, nil
+	}
+
+	items := NewCompileItemStore(db)
+
+	completedSet := make(map[string]bool)
+	for _, p := range state.Completed {
+		completedSet[p] = true
+	}
+	failedSet := make(map[string]FailedSource)
+	for _, f := range state.Failed {
+		failedSet[f.Path] = f
+	}
+
+	migrated := 0
+
+	// Migrate all sources from manifest into compile_items
+	for path, src := range mf.Sources {
+		item := CompileItem{
+			SourcePath:  path,
+			Hash:        src.Hash,
+			FileType:    src.Type,
+			SizeBytes:   src.SizeBytes,
+			Tier:        resolveTierDefault(path, cfg),
+			TierDefault: resolveTierDefault(path, cfg),
+			SourceType:  "compiler",
+			CompileID:   state.CompileID,
+		}
+
+		if src.SummaryPath != "" {
+			item.SummaryPath = src.SummaryPath
+		}
+
+		// Sources with status "compiled" have completed all passes
+		if src.Status == "compiled" {
+			item.Tier = 3
+			item.PassIndexed = true
+			item.PassEmbedded = true
+			item.PassSummarized = true
+			item.PassExtracted = true
+			item.PassWritten = true
+		} else if completedSet[path] {
+			// In the checkpoint's completed list — mark passes based on checkpoint pass level
+			item.PassIndexed = true
+			item.PassEmbedded = true
+			if state.Pass >= 1 {
+				item.PassSummarized = true
+			}
+			if state.Pass >= 2 {
+				item.PassExtracted = true
+			}
+			if state.Pass >= 3 {
+				item.PassWritten = true
+			}
+		}
+
+		// Record errors from checkpoint
+		if failed, ok := failedSet[path]; ok {
+			item.Error = failed.Error
+			item.ErrorCount = failed.Attempts
+		}
+
+		if err := items.Upsert(item); err != nil {
+			return false, err
+		}
+		migrated++
+	}
+
+	// Also migrate pending sources that might not be in manifest yet
+	for _, p := range state.Pending {
+		if _, exists := mf.Sources[p]; exists {
+			continue // already handled above
+		}
+		item := CompileItem{
+			SourcePath:  p,
+			Tier:        1, // default for unknown sources
+			TierDefault: 1,
+			SourceType:  "compiler",
+			CompileID:   state.CompileID,
+		}
+		if err := items.Upsert(item); err != nil {
+			return false, err
+		}
+		migrated++
+	}
+
+	// Delete the JSON checkpoint
+	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
+		log.Warn("failed to remove compile-state.json", "error", err)
+	}
+
+	log.Info("checkpoint migrated to compile_items",
+		"sources", migrated, "completed", len(state.Completed),
+		"pending", len(state.Pending), "failed", len(state.Failed))
+
+	return true, nil
+}
+
+// resolveTierDefault returns the default tier for a source path based on config.
+// Uses file extension (not semantic type) to match tier_defaults, consistent
+// with TierManager.ConfigDefault.
+func resolveTierDefault(sourcePath string, cfg *config.Config) int {
+	ext := strings.TrimPrefix(filepath.Ext(sourcePath), ".")
+	if cfg.Compiler.TierDefaults != nil {
+		if tier, ok := cfg.Compiler.TierDefaults[ext]; ok {
+			return tier
+		}
+	}
+	if cfg.Compiler.DefaultTier > 0 {
+		return cfg.Compiler.DefaultTier
+	}
+	return 1 // default
+}
+
+// PopulateFromManifest creates compile_items entries for all manifest sources
+// that don't already exist in compile_items. Used on first run after migration V5
+// when there is no compile-state.json to migrate.
+func PopulateFromManifest(db *storage.DB, mf *manifest.Manifest, cfg *config.Config) (int, error) {
+	items := NewCompileItemStore(db)
+	populated := 0
+
+	for path, src := range mf.Sources {
+		// Skip if already exists
+		existing, err := items.GetByPath(path)
+		if err != nil {
+			return populated, err
+		}
+		if existing != nil {
+			continue
+		}
+
+		item := CompileItem{
+			SourcePath:  path,
+			Hash:        src.Hash,
+			FileType:    src.Type,
+			SizeBytes:   src.SizeBytes,
+			Tier:        resolveTierDefault(path, cfg),
+			TierDefault: resolveTierDefault(path, cfg),
+			SourceType:  "compiler",
+		}
+
+		if src.SummaryPath != "" {
+			item.SummaryPath = src.SummaryPath
+		}
+
+		if src.Status == "compiled" {
+			item.Tier = 3
+			item.PassIndexed = true
+			item.PassEmbedded = true
+			item.PassSummarized = true
+			item.PassExtracted = true
+			item.PassWritten = true
+		}
+
+		if err := items.Upsert(item); err != nil {
+			return populated, err
+		}
+		populated++
+	}
+
+	return populated, nil
+}

@@ -20,16 +20,16 @@ These edges power the knowledge graph visualization, Q&A context retrieval, and 
 
 ## Built-in relation types
 
-| Type | Keywords | Notes |
-|------|----------|-------|
-| `implements` | implements, implementation of, is an implementation, 实现了, 实现方式 | |
-| `extends` | extends, extension of, builds on, builds upon, 扩展了, 基于 | |
-| `optimizes` | optimizes, optimization of, improves upon, faster than, 优化了, 改进了, 提升了 | |
-| `contradicts` | contradicts, conflicts with, disagrees with, challenges, 矛盾, 冲突, 挑战了 | |
-| `cites` | *(none)* | Created programmatically when articles reference sources |
-| `prerequisite_of` | prerequisite, requires knowledge of, depends on, built on top of, 前提, 依赖于, 前置条件 | |
-| `trades_off` | trade-off, tradeoff, trades off, at the cost of, 取舍, 权衡, 代价是 | |
-| `derived_from` | *(none)* | Created programmatically by the Q&A system when filing answers |
+| Type              | Keywords                                                                                 | Notes                                                          |
+| ----------------- | ---------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `implements`      | implements, implementation of, is an implementation, 实现了, 实现方式                    |                                                                |
+| `extends`         | extends, extension of, builds on, builds upon, 扩展了, 基于                              |                                                                |
+| `optimizes`       | optimizes, optimization of, improves upon, faster than, 优化了, 改进了, 提升了           |                                                                |
+| `contradicts`     | contradicts, conflicts with, disagrees with, challenges, 矛盾, 冲突, 挑战了              |                                                                |
+| `cites`           | _(none)_                                                                                 | Created programmatically when articles reference sources       |
+| `prerequisite_of` | prerequisite, requires knowledge of, depends on, built on top of, 前提, 依赖于, 前置条件 |                                                                |
+| `trades_off`      | trade-off, tradeoff, trades off, at the cost of, 取舍, 权衡, 代价是                      |                                                                |
+| `derived_from`    | _(none)_                                                                                 | Created programmatically by the Q&A system when filing answers |
 
 Built-in types are always present. They cannot be removed, but you can add synonyms to them.
 
@@ -39,7 +39,7 @@ Add an `ontology` section to your `config.yaml`:
 
 ```yaml
 ontology:
-  relations:
+  relation_types:
     # Extend a built-in type with additional synonyms
     - name: implements
       synonyms: ["thực hiện", "triển khai"]
@@ -55,7 +55,7 @@ When the `name` matches a built-in type, your synonyms are **appended** to the d
 
 ```yaml
 ontology:
-  relations:
+  relation_types:
     - name: implements
       synonyms: ["thực hiện", "triển khai"]
 ```
@@ -63,6 +63,7 @@ ontology:
 After merging, `implements` will match all of its original English and Chinese keywords **plus** the Vietnamese ones you added.
 
 This is useful for:
+
 - **Multilingual wikis** — add keywords in your language so the compiler detects relations in non-English content
 - **Domain jargon** — add field-specific phrases that mean the same thing (e.g., "is a subclass of" for `extends`)
 
@@ -72,7 +73,7 @@ When the `name` doesn't match any built-in, a new relation type is created:
 
 ```yaml
 ontology:
-  relations:
+  relation_types:
     - name: regulates
       synonyms: ["regulates", "regulated by", "调控", "调节"]
     - name: inspired_by
@@ -84,6 +85,7 @@ Custom types work exactly like built-in types: the compiler scans for their keyw
 ### Naming rules
 
 Relation names must:
+
 - Start with a lowercase letter
 - Contain only lowercase letters, digits, and underscores
 - Match the pattern `^[a-z][a-z0-9_]*$`
@@ -99,7 +101,7 @@ Invalid names are rejected at config load time with a clear error message.
 
 ```yaml
 ontology:
-  relations:
+  relation_types:
     - name: regulates
       synonyms: ["regulates", "regulated by", "activates", "inhibits", "调控"]
     - name: encodes
@@ -112,7 +114,7 @@ ontology:
 
 ```yaml
 ontology:
-  relations:
+  relation_types:
     - name: depends_on
       synonyms: ["depends on", "dependency of", "requires"]
     - name: wraps
@@ -125,9 +127,10 @@ ontology:
 
 ```yaml
 ontology:
-  relations:
+  relation_types:
     - name: inspired_by
-      synonyms: ["inspired by", "influenced by", "draws from", "in the tradition of"]
+      synonyms:
+        ["inspired by", "influenced by", "draws from", "in the tradition of"]
     - name: critiques
       synonyms: ["critiques", "critique of", "responds to", "counters"]
     - name: synthesizes

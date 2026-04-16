@@ -172,7 +172,7 @@ func buildFTSQuery(query string) string {
 	words := strings.Fields(strings.ToLower(query))
 	var terms []string
 	for _, w := range words {
-		w = sanitizeFTS(w)
+		w = SanitizeFTS(w)
 		if w == "" {
 			continue
 		}
@@ -183,7 +183,7 @@ func buildFTSQuery(query string) string {
 	if len(terms) == 0 {
 		// If all words are stopwords, use them anyway
 		for _, w := range words {
-			w = sanitizeFTS(w)
+			w = SanitizeFTS(w)
 			if w == "" {
 				continue
 			}
@@ -193,8 +193,8 @@ func buildFTSQuery(query string) string {
 	return strings.Join(terms, " OR ")
 }
 
-// sanitizeFTS strips FTS5 special characters to prevent query injection.
-func sanitizeFTS(s string) string {
+// SanitizeFTS strips FTS5 special characters to prevent query injection.
+func SanitizeFTS(s string) string {
 	var buf strings.Builder
 	for _, r := range s {
 		// Keep only alphanumeric, hyphens, and underscores

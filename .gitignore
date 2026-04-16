@@ -8,14 +8,9 @@ CLAUDE.md
 .sage-memory/
 sage/
 
+# macOS
+.DS_Store
+
 # Build
 /sage-wiki
-sage-wiki
-sage-wiki.exe
-sage-wiki-webui
-sage-wiki-webui.exe
-bin/
-internal/web/dist/
-
-# Images
-*.png
+bin/__pycache__/

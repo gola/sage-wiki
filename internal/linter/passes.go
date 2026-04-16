@@ -145,7 +145,7 @@ func (p *OrphansPass) Run(ctx *LintContext) ([]Finding, error) {
 		return nil, nil
 	}
 
-	ontStore := ontology.NewStore(ctx.DB, ctx.ValidRelations)
+	ontStore := ontology.NewStore(ctx.DB, ctx.ValidRelations, ctx.ValidEntityTypes)
 
 	entities, err := ontStore.ListEntities("")
 	if err != nil {
@@ -228,7 +228,7 @@ func (p *ConnectionsPass) Run(ctx *LintContext) ([]Finding, error) {
 	}
 
 	vecStore := vectors.NewStore(ctx.DB)
-	ontStore := ontology.NewStore(ctx.DB, ctx.ValidRelations)
+	ontStore := ontology.NewStore(ctx.DB, ctx.ValidRelations, ctx.ValidEntityTypes)
 
 	// Get all concept entities with vectors
 	concepts, err := ontStore.ListEntities("concept")
@@ -393,6 +393,93 @@ func (p *StalenessPass) Run(ctx *LintContext) ([]Finding, error) {
 				Message:  fmt.Sprintf("article is %d days old", int(age.Hours()/24)),
 			})
 		}
+	}
+
+	return findings, nil
+}
+
+// QualityPass checks compile_items for low quality scores and tier distribution.
+type QualityPass struct {
+	Threshold float64 // quality_score threshold (default 0.5)
+}
+
+func (p *QualityPass) Name() string       { return "quality" }
+func (p *QualityPass) CanAutoFix() bool    { return false }
+func (p *QualityPass) Fix(_ *LintContext, _ []Finding) error { return nil }
+
+func (p *QualityPass) Run(ctx *LintContext) ([]Finding, error) {
+	var findings []Finding
+	threshold := p.Threshold
+	if threshold <= 0 {
+		threshold = 0.5
+	}
+
+	cleanup, err := ctx.EnsureDB()
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	if ctx.DB == nil {
+		return findings, nil
+	}
+
+	// Check for low quality articles
+	rows, err := ctx.DB.ReadDB().Query(
+		"SELECT source_path, quality_score FROM compile_items WHERE quality_score IS NOT NULL AND quality_score < ?",
+		threshold,
+	)
+	if err != nil {
+		return findings, nil // table may not exist
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var path string
+		var score float64
+		if rows.Scan(&path, &score) == nil {
+			findings = append(findings, Finding{
+				Pass:     "quality",
+				Severity: SevWarning,
+				Path:     path,
+				Message:  fmt.Sprintf("low quality score: %.2f (threshold: %.2f)", score, threshold),
+			})
+		}
+	}
+
+	// Tier distribution summary
+	tierRows, err := ctx.DB.ReadDB().Query("SELECT tier, COUNT(*) FROM compile_items GROUP BY tier ORDER BY tier")
+	if err != nil {
+		return findings, nil
+	}
+	defer tierRows.Close()
+
+	var tierInfo []string
+	for tierRows.Next() {
+		var tier, count int
+		if tierRows.Scan(&tier, &count) == nil {
+			tierInfo = append(tierInfo, fmt.Sprintf("T%d=%d", tier, count))
+		}
+	}
+	if len(tierInfo) > 0 {
+		findings = append(findings, Finding{
+			Pass:     "quality",
+			Severity: SevInfo,
+			Path:     "",
+			Message:  "tier distribution: " + strings.Join(tierInfo, " "),
+		})
+	}
+
+	// Error count
+	var errCount int
+	ctx.DB.ReadDB().QueryRow("SELECT COUNT(*) FROM compile_items WHERE error IS NOT NULL AND error != ''").Scan(&errCount)
+	if errCount > 0 {
+		findings = append(findings, Finding{
+			Pass:     "quality",
+			Severity: SevWarning,
+			Path:     "",
+			Message:  fmt.Sprintf("%d sources have compilation errors", errCount),
+		})
 	}
 
 	return findings, nil

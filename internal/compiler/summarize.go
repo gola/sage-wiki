@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"os"
@@ -26,46 +27,95 @@ type SummaryResult struct {
 	Error       error
 }
 
+// SummarizeOpts configures a summarization pass.
+type SummarizeOpts struct {
+	Ctx         context.Context // optional; checked between sources for cancellation
+	ProjectDir  string
+	OutputDir   string
+	Sources     []SourceInfo
+	Client      *llm.Client
+	Model       string
+	MaxTokens   int
+	MaxParallel int
+	UserTZ      *time.Location
+	Language    string
+	Backpressure *BackpressureController // optional; if nil, uses fixed semaphore
+}
+
 // Summarize processes sources through Pass 1, producing summaries.
-// visionClient is optional - if nil, vision processing will be skipped.
-func Summarize(
-	projectDir string,
-	outputDir string,
-	sources []SourceInfo,
-	client *llm.Client,
-	model string,
-	maxTokens int,
-	maxParallel int,
-	userTZ *time.Location,
-	visionClient *llm.Client,
-	visionModel string,
-	visionEnabled bool,
-) []SummaryResult {
+func Summarize(opts SummarizeOpts) []SummaryResult {
+	maxParallel := opts.MaxParallel
 	if maxParallel <= 0 {
-		maxParallel = 4
+		maxParallel = 20
 	}
 
-	results := make([]SummaryResult, len(sources))
-	sem := make(chan struct{}, maxParallel)
+	results := make([]SummaryResult, len(opts.Sources))
 	var wg sync.WaitGroup
 	var done atomic.Int32
-	total := len(sources)
+	var consecutiveErrors atomic.Int32
+	total := len(opts.Sources)
+	var stopped atomic.Bool
 
-	for i, src := range sources {
+	// Use BackpressureController if available, otherwise fixed semaphore
+	var sem chan struct{}
+	if opts.Backpressure == nil {
+		sem = make(chan struct{}, maxParallel)
+	}
+
+	for i, src := range opts.Sources {
+		// Check for context cancellation between sources
+		if opts.Ctx != nil {
+			select {
+			case <-opts.Ctx.Done():
+				results[i] = SummaryResult{SourcePath: src.Path, Error: fmt.Errorf("cancelled: %w", opts.Ctx.Err())}
+				stopped.Store(true)
+				continue
+			default:
+			}
+		}
+
+		if stopped.Load() {
+			results[i] = SummaryResult{SourcePath: src.Path, Error: fmt.Errorf("skipped: circuit breaker triggered")}
+			continue
+		}
+
 		wg.Add(1)
-		sem <- struct{}{}
+
+		// Acquire concurrency slot
+		var release func()
+		if opts.Backpressure != nil {
+			release = opts.Backpressure.Acquire()
+		} else {
+			sem <- struct{}{}
+			release = func() { <-sem }
+		}
 
 		go func(idx int, info SourceInfo) {
 			defer wg.Done()
-			defer func() { <-sem }()
+			defer release()
 
-			result := summarizeOne(projectDir, outputDir, info, client, model, maxTokens, userTZ, visionClient, visionModel, visionEnabled)
+			result := summarizeOne(opts.ProjectDir, opts.OutputDir, info, opts.Client, opts.Model, opts.MaxTokens, opts.UserTZ, opts.Language)
 			results[idx] = result
 
 			n := int(done.Add(1))
 			if result.Error != nil {
+				// Signal backpressure controller on rate limit errors
+				if opts.Backpressure != nil && llm.IsRateLimitError(result.Error) {
+					delay := opts.Backpressure.OnRateLimit()
+					log.Warn("rate limited, backing off", "delay", delay, "new_limit", opts.Backpressure.CurrentLimit())
+					time.Sleep(delay)
+				}
+				errCount := consecutiveErrors.Add(1)
 				log.Error("summarize failed", "progress", fmt.Sprintf("%d/%d", n, total), "source", info.Path, "error", result.Error)
+				if errCount >= 5 {
+					log.Error("circuit breaker: 5 consecutive failures, skipping remaining sources")
+					stopped.Store(true)
+				}
 			} else {
+				if opts.Backpressure != nil {
+					opts.Backpressure.OnSuccess()
+				}
+				consecutiveErrors.Store(0)
 				log.Info("summarized", "progress", fmt.Sprintf("%d/%d", n, total), "source", info.Path)
 			}
 		}(i, src)
@@ -83,9 +133,7 @@ func summarizeOne(
 	model string,
 	maxTokens int,
 	userTZ *time.Location,
-	visionClient *llm.Client,
-	visionModel string,
-	visionEnabled bool,
+	language string,
 ) SummaryResult {
 	result := SummaryResult{SourcePath: info.Path}
 
@@ -101,23 +149,7 @@ func summarizeOne(
 
 	// Handle image sources — use vision if available
 	if extract.IsImageSource(content) {
-		// Check if vision is disabled
-		if !visionEnabled {
-			result.Error = fmt.Errorf("skipping image %s — vision processing is disabled", info.Path)
-			return result
-		}
-
-		// Use vision client if available, otherwise try main client
-		visionClientToUse := visionClient
-		visionModelToUse := visionModel
-
-		if visionClientToUse == nil {
-			// Fall back to main client if no separate vision client
-			visionClientToUse = client
-			visionModelToUse = model
-		}
-
-		text, err := summarizeImage(projectDir, info, visionClientToUse, visionModelToUse, maxTokens)
+		text, err := summarizeImage(projectDir, info, client, model, maxTokens)
 		if err != nil {
 			result.Error = err
 			return result
@@ -132,7 +164,7 @@ func summarizeOne(
 
 	// Select prompt template — try type-specific first, fall back to article
 	templateName := "summarize_" + content.Type
-	if _, err := prompts.Render(templateName, prompts.SummarizeData{}); err != nil {
+	if _, err := prompts.Render(templateName, prompts.SummarizeData{}, ""); err != nil {
 		templateName = "summarize_article" // fallback for unknown types
 	}
 
@@ -142,7 +174,7 @@ func summarizeOne(
 			SourcePath: info.Path,
 			SourceType: content.Type,
 			MaxTokens:  maxTokens,
-		})
+		}, language)
 		if err != nil {
 			result.Error = fmt.Errorf("render prompt: %w", err)
 			return result
@@ -160,7 +192,7 @@ func summarizeOne(
 		summaryText = resp.Content
 	} else {
 		// Multi-chunk: summarize each chunk, then synthesize hierarchically
-		chunkSummaries, err := summarizeChunks(content.Chunks, info, templateName, content.Type, client, model, maxTokens)
+		chunkSummaries, err := summarizeChunks(content.Chunks, info, templateName, content.Type, client, model, maxTokens, language)
 		if err != nil {
 			result.Error = err
 			return result
@@ -174,7 +206,23 @@ func summarizeOne(
 		}
 	}
 
+	if err := validateSummary(summaryText); err != nil {
+		result.Error = fmt.Errorf("summary quality check failed for %s: %w", info.Path, err)
+		return result
+	}
+
 	return writeSummaryFile(projectDir, outputDir, info, content, summaryText, result, userTZ)
+}
+
+// validateSummary checks minimum quality thresholds for a generated summary.
+// Returns an error if the summary is too short or lacks basic structure,
+// causing the source to be marked as failed and retried on next compile.
+func validateSummary(text string) error {
+	runes := []rune(strings.TrimSpace(text))
+	if len(runes) < 100 {
+		return fmt.Errorf("summary too short (%d chars, minimum 100)", len(runes))
+	}
+	return nil
 }
 
 func writeSummaryFile(projectDir, outputDir string, info SourceInfo, content *extract.SourceContent, summaryText string, result SummaryResult, loc *time.Location) SummaryResult {
@@ -232,8 +280,11 @@ func summarizeImage(projectDir string, info SourceInfo, client *llm.Client, mode
 
 const (
 	// minChunkTokenBudget is the minimum output tokens per chunk summary.
-	// Below this, LLMs produce empty or unusable output.
-	minChunkTokenBudget = 200
+	// Reasoning models (MiniMax, DeepSeek) use ~100-200 tokens for <think>
+	// traces, so 200 is too low — the model exhausts the budget on reasoning
+	// with nothing left for actual content. 500 leaves ~300 tokens for output
+	// after think overhead, producing usable summaries (~200 CJK characters).
+	minChunkTokenBudget = 500
 
 	// synthesisGroupSize is the max number of summaries per synthesis call.
 	// Keeps each synthesis step at a manageable compression ratio (~8x).
@@ -251,9 +302,11 @@ func summarizeChunks(
 	client *llm.Client,
 	model string,
 	maxTokens int,
+	language string,
 ) ([]string, error) {
 	// Group chunks if per-chunk budget is too low
 	groups := groupChunks(chunks, maxTokens)
+	log.Debug("chunk grouping", "source", info.Path, "chunks", len(chunks), "groups", len(groups), "max_tokens", maxTokens)
 	if len(groups) == 0 {
 		return nil, fmt.Errorf("summarize: no chunk groups for %q", info.Path)
 	}
@@ -283,11 +336,12 @@ func summarizeChunks(
 			SourcePath: info.Path,
 			SourceType: sourceType,
 			MaxTokens:  perGroupBudget,
-		})
+		}, language)
 		if err != nil {
 			return nil, fmt.Errorf("group %d render prompt: %w", gi, err)
 		}
 
+		log.Debug("summarizing group", "source", info.Path, "group", fmt.Sprintf("%d/%d", gi+1, len(groups)), "chunks_in_group", len(group), "budget", perGroupBudget)
 		resp, err := client.ChatCompletion([]llm.Message{
 			{Role: "system", Content: "You are summarizing a section of a larger document."},
 			{Role: "user", Content: prompt + "\n\n---\n\nSection:\n\n" + groupText.String()},
@@ -348,7 +402,11 @@ func synthesizeHierarchical(summaries []string, sourcePath string, client *llm.C
 	if len(summaries) == 0 {
 		return "", fmt.Errorf("synthesize: no summaries to combine for %q", sourcePath)
 	}
+	tier := 0
 	for len(summaries) > 1 {
+		tier++
+		nextGroups := (len(summaries) + synthesisGroupSize - 1) / synthesisGroupSize
+		log.Debug("synthesis tier", "source", sourcePath, "tier", tier, "input_summaries", len(summaries), "output_groups", nextGroups)
 		var nextLevel []string
 
 		for i := 0; i < len(summaries); i += synthesisGroupSize {

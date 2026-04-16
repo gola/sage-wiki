@@ -14,8 +14,11 @@ func TestDefaults(t *testing.T) {
 	if cfg.Output != "wiki" {
 		t.Errorf("expected output 'wiki', got %q", cfg.Output)
 	}
-	if cfg.Compiler.MaxParallel != 4 {
-		t.Errorf("expected max_parallel 4, got %d", cfg.Compiler.MaxParallel)
+	if cfg.Compiler.MaxParallel != 20 {
+		t.Errorf("expected max_parallel 20, got %d", cfg.Compiler.MaxParallel)
+	}
+	if cfg.Compiler.DefaultTier != 1 {
+		t.Errorf("expected default_tier 1, got %d", cfg.Compiler.DefaultTier)
 	}
 	if cfg.Search.HybridWeightBM25 != 0.7 {
 		t.Errorf("expected bm25 weight 0.7, got %f", cfg.Search.HybridWeightBM25)
@@ -198,8 +201,26 @@ func TestValidation(t *testing.T) {
 			wantErr: "invalid name",
 		},
 		{
-			name: "valid relation names",
+			name: "valid relation names via relations key",
 			cfg:  Config{Project: "test", Output: "wiki", Sources: []Source{{Path: "raw"}}, Ontology: OntologyConfig{Relations: []RelationConfig{{Name: "regulates", Synonyms: []string{"regulates"}}, {Name: "implements"}}}},
+		},
+		{
+			name: "valid relation names via relation_types key",
+			cfg:  Config{Project: "test", Output: "wiki", Sources: []Source{{Path: "raw"}}, Ontology: OntologyConfig{RelationTypes: []RelationConfig{{Name: "regulates"}, {Name: "implements"}}}},
+		},
+		{
+			name:    "invalid entity type name uppercase",
+			cfg:     Config{Project: "test", Output: "wiki", Sources: []Source{{Path: "raw"}}, Ontology: OntologyConfig{EntityTypes: []EntityTypeConfig{{Name: "Concept"}}}},
+			wantErr: "invalid name",
+		},
+		{
+			name:    "invalid entity type name empty",
+			cfg:     Config{Project: "test", Output: "wiki", Sources: []Source{{Path: "raw"}}, Ontology: OntologyConfig{EntityTypes: []EntityTypeConfig{{Name: ""}}}},
+			wantErr: "name is required",
+		},
+		{
+			name: "valid entity type names",
+			cfg:  Config{Project: "test", Output: "wiki", Sources: []Source{{Path: "raw"}}, Ontology: OntologyConfig{EntityTypes: []EntityTypeConfig{{Name: "conversation"}, {Name: "decision"}}}},
 		},
 		{
 			name: "valid empty ontology",
@@ -228,6 +249,28 @@ func TestValidation(t *testing.T) {
 				t.Errorf("expected error containing %q, got %q", tt.wantErr, err.Error())
 			}
 		})
+	}
+}
+
+func TestRelationTypesMergePrecedence(t *testing.T) {
+	cfg := Config{
+		Project: "test",
+		Output:  "wiki",
+		Sources: []Source{{Path: "raw"}},
+		Ontology: OntologyConfig{
+			Relations:     []RelationConfig{{Name: "old_key"}},
+			RelationTypes: []RelationConfig{{Name: "new_key"}},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	// relation_types should take precedence
+	if len(cfg.Ontology.Relations) != 1 || cfg.Ontology.Relations[0].Name != "new_key" {
+		t.Errorf("expected relation_types to override relations, got %v", cfg.Ontology.Relations)
+	}
+	if len(cfg.Ontology.RelationTypes) != 0 {
+		t.Error("expected RelationTypes to be normalized to nil after merge")
 	}
 }
 
@@ -305,8 +348,8 @@ func TestCostConfigDefaults(t *testing.T) {
 	if !cfg.Compiler.PromptCacheEnabled() {
 		t.Error("expected prompt_cache enabled by default")
 	}
-	if cfg.Compiler.Mode != "" {
-		t.Errorf("expected empty default mode, got %q", cfg.Compiler.Mode)
+	if cfg.Compiler.Mode != "auto" {
+		t.Errorf("expected default mode 'auto', got %q", cfg.Compiler.Mode)
 	}
 }
 
@@ -365,6 +408,189 @@ func TestUserTimeLocation(t *testing.T) {
 	}
 	if cfg.Compiler.UserTimeLocation().String() != "America/New_York" {
 		t.Errorf("expected America/New_York after Validate, got %s", cfg.Compiler.UserTimeLocation())
+	}
+}
+
+func TestTypeSignalParsing(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+
+	content := `
+version: 1
+project: test-wiki
+sources:
+  - path: raw
+    type: auto
+    watch: true
+output: wiki
+type_signals:
+  - type: regulation
+    filename_keywords: ["法规", "办法"]
+    content_keywords: ["第一条", "第二条"]
+    min_content_hits: 2
+  - type: research
+    filename_keywords: ["研报"]
+    content_keywords: ["投资评级"]
+    min_content_hits: 1
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if len(cfg.TypeSignals) != 2 {
+		t.Fatalf("expected 2 type signals, got %d", len(cfg.TypeSignals))
+	}
+	if cfg.TypeSignals[0].Type != "regulation" {
+		t.Errorf("expected type 'regulation', got %q", cfg.TypeSignals[0].Type)
+	}
+	if len(cfg.TypeSignals[0].FilenameKeywords) != 2 {
+		t.Errorf("expected 2 filename keywords, got %d", len(cfg.TypeSignals[0].FilenameKeywords))
+	}
+	if cfg.TypeSignals[0].MinContentHits != 2 {
+		t.Errorf("expected min_content_hits 2, got %d", cfg.TypeSignals[0].MinContentHits)
+	}
+}
+
+func TestTypeSignalValidation(t *testing.T) {
+	base := Config{Project: "test", Output: "wiki", Sources: []Source{{Path: "raw"}}}
+
+	tests := []struct {
+		name    string
+		signals []TypeSignal
+		wantErr string
+	}{
+		{
+			name:    "missing type",
+			signals: []TypeSignal{{FilenameKeywords: []string{"foo"}}},
+			wantErr: "type is required",
+		},
+		{
+			name:    "no keywords at all",
+			signals: []TypeSignal{{Type: "regulation"}},
+			wantErr: "at least one keyword",
+		},
+		{
+			name:    "content keywords without min_content_hits",
+			signals: []TypeSignal{{Type: "regulation", ContentKeywords: []string{"foo"}}},
+			wantErr: "min_content_hits must be > 0",
+		},
+		{
+			name:    "valid filename only",
+			signals: []TypeSignal{{Type: "regulation", FilenameKeywords: []string{"foo"}}},
+		},
+		{
+			name:    "valid content keywords with min hits",
+			signals: []TypeSignal{{Type: "regulation", ContentKeywords: []string{"foo"}, MinContentHits: 1}},
+		},
+		{
+			name:    "valid pattern only",
+			signals: []TypeSignal{{Type: "regulation", Pattern: "foo"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base
+			cfg.TypeSignals = tt.signals
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Errorf("expected error containing %q, got nil", tt.wantErr)
+				return
+			}
+			if !contains(err.Error(), tt.wantErr) {
+				t.Errorf("expected error containing %q, got %q", tt.wantErr, err.Error())
+			}
+		})
+	}
+}
+
+func TestLoadWithExtends(t *testing.T) {
+	dir := t.TempDir()
+
+	basePath := filepath.Join(dir, "sage-base.yaml")
+	baseContent := `
+version: 1
+project: base-wiki
+description: "Base"
+sources:
+  - path: raw
+    type: auto
+output: wiki
+api:
+  provider: openai-compatible
+  api_key: sk-base-key
+  base_url: https://api.example.com/v1
+  rate_limit: 480
+models:
+  summarize: model-a
+  extract: model-a
+  write: model-a
+compiler:
+  max_parallel: 8
+  summary_max_tokens: 8000
+`
+	os.WriteFile(basePath, []byte(baseContent), 0644)
+
+	childDir := filepath.Join(dir, "child")
+	os.MkdirAll(childDir, 0755)
+	childPath := filepath.Join(childDir, "config.yaml")
+	childContent := `
+extends: ../sage-base.yaml
+project: child-wiki
+sources:
+  - path: raw
+    type: auto
+output: wiki
+`
+	os.WriteFile(childPath, []byte(childContent), 0644)
+
+	cfg, err := Load(childPath)
+	if err != nil {
+		t.Fatalf("Load with extends: %v", err)
+	}
+	if cfg.Project != "child-wiki" {
+		t.Errorf("project: got %q, want child-wiki", cfg.Project)
+	}
+	if cfg.API.Provider != "openai-compatible" {
+		t.Errorf("api.provider not inherited: got %q", cfg.API.Provider)
+	}
+	if cfg.API.RateLimit != 480 {
+		t.Errorf("rate_limit not inherited: got %d", cfg.API.RateLimit)
+	}
+	if cfg.Compiler.SummaryMaxTokens != 8000 {
+		t.Errorf("summary_max_tokens not inherited: got %d", cfg.Compiler.SummaryMaxTokens)
+	}
+}
+
+func TestLoadExtendsMissing(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgPath, []byte(`
+extends: ../nonexistent.yaml
+project: test
+sources:
+  - path: raw
+    type: auto
+output: wiki
+`), 0644)
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("should not fail on missing base: %v", err)
+	}
+	if cfg.Project != "test" {
+		t.Errorf("project: got %q", cfg.Project)
 	}
 }
 
