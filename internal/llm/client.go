@@ -59,8 +59,12 @@ type Client struct {
 	cacheID  string       // active cache ID (empty = no caching)
 }
 
+// DefaultTimeoutSeconds is the default HTTP timeout for LLM API calls.
+const DefaultTimeoutSeconds = 120
+
 // NewClient creates a new LLM client for the given provider.
-func NewClient(providerName string, apiKey string, baseURL string, rateLimit int) (*Client, error) {
+// If timeoutSeconds <= 0, uses DefaultTimeoutSeconds (120s).
+func NewClient(providerName string, apiKey string, baseURL string, rateLimit int, timeoutSeconds int) (*Client, error) {
 	p, err := newProvider(providerName, apiKey, baseURL)
 	if err != nil {
 		return nil, err
@@ -68,6 +72,10 @@ func NewClient(providerName string, apiKey string, baseURL string, rateLimit int
 
 	if rateLimit <= 0 {
 		rateLimit = defaultRateLimit(providerName)
+	}
+
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = DefaultTimeoutSeconds
 	}
 
 	// Create HTTP client with TLS settings to avoid EOF issues
@@ -86,19 +94,20 @@ func NewClient(providerName string, apiKey string, baseURL string, rateLimit int
 		provider: p,
 		limiter:  newRateLimiter(rateLimit),
 		client: http.Client{
-			Timeout:   120 * time.Second,
+			Timeout:   time.Duration(timeoutSeconds) * time.Second,
 			Transport: tlsConfig,
 		},
 	}, nil
 }
 
 // NewVisionClient creates a new LLM client for vision processing using VisionAPIConfig.
-func NewVisionClient(providerName string, apiKey string, baseURL string, rateLimit int) (*Client, error) {
+// If timeoutSeconds <= 0, uses DefaultTimeoutSeconds (120s).
+func NewVisionClient(providerName string, apiKey string, baseURL string, rateLimit int, timeoutSeconds int) (*Client, error) {
 	// Use openai-compatible as default for vision if not specified
 	if providerName == "" {
 		providerName = "openai-compatible"
 	}
-	return NewClient(providerName, apiKey, baseURL, rateLimit)
+	return NewClient(providerName, apiKey, baseURL, rateLimit, timeoutSeconds)
 }
 
 // ChatCompletion sends a chat completion request with retry on rate limits.

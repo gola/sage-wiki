@@ -44,10 +44,11 @@ type Source struct {
 }
 
 type APIConfig struct {
-	Provider  string `yaml:"provider"`
-	APIKey    string `yaml:"api_key"`
-	BaseURL   string `yaml:"base_url,omitempty"`
-	RateLimit int    `yaml:"rate_limit,omitempty"`
+	Provider       string `yaml:"provider"`
+	APIKey         string `yaml:"api_key"`
+	BaseURL        string `yaml:"base_url,omitempty"`
+	RateLimit      int    `yaml:"rate_limit,omitempty"`
+	TimeoutSeconds int    `yaml:"timeout_seconds,omitempty"` // HTTP timeout for LLM API calls (default: 120)
 }
 
 type ModelsConfig struct {
@@ -106,10 +107,11 @@ type ServeConfig struct {
 
 // VisionAPIConfig configures a separate API for vision processing.
 type VisionAPIConfig struct {
-	Provider string `yaml:"provider,omitempty"`
-	APIKey   string `yaml:"api_key,omitempty"`
-	BaseURL  string `yaml:"base_url,omitempty"`
-	Model    string `yaml:"model,omitempty"`
+	Provider       string `yaml:"provider,omitempty"`
+	APIKey         string `yaml:"api_key,omitempty"`
+	BaseURL        string `yaml:"base_url,omitempty"`
+	Model          string `yaml:"model,omitempty"`
+	TimeoutSeconds int    `yaml:"timeout_seconds,omitempty"` // HTTP timeout for vision API calls (default: 120)
 }
 
 // OntologyConfig configures ontology relation types.

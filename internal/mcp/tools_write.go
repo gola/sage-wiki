@@ -392,7 +392,7 @@ func extractKnowledgeItems(cfg *config.Config, content, captureCtx, tags string)
 		return nil, fmt.Errorf("LLM not configured (no api.provider or api.api_key)")
 	}
 
-	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit)
+	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit, cfg.API.TimeoutSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("create LLM client: %w", err)
 	}

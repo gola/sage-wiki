@@ -215,7 +215,7 @@ func TestChatCompletionCachedFallbackNonCachingProvider(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client, err := NewClient("openai", "sk-test", srv.URL, 1000)
+	client, err := NewClient("openai", "sk-test", srv.URL, 1000, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestChatCompletionCachedFallbackOnHTTPError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client, err := NewClient("anthropic", "sk-test", srv.URL, 1000)
+	client, err := NewClient("anthropic", "sk-test", srv.URL, 1000, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestClientSetupCacheNonCachingProvider(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()
 
-	client, err := NewClient("openai", "sk-test", srv.URL, 1000)
+	client, err := NewClient("openai", "sk-test", srv.URL, 1000, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +324,7 @@ func TestClientAutoRoutingThroughCache(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client, err := NewClient("anthropic", "sk-test", srv.URL, 1000)
+	client, err := NewClient("anthropic", "sk-test", srv.URL, 1000, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

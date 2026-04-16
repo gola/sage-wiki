@@ -37,7 +37,7 @@ func TestOpenAIFormat(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient("openai", "sk-test", server.URL, 1000)
+	client, err := NewClient("openai", "sk-test", server.URL, 1000, 0)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestAnthropicFormat(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient("anthropic", "sk-ant-test", server.URL, 1000)
+	client, err := NewClient("anthropic", "sk-ant-test", server.URL, 1000, 0)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestGeminiFormat(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient("gemini", "gemini-key", server.URL, 1000)
+	client, err := NewClient("gemini", "gemini-key", server.URL, 1000, 0)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestRetryOn429(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient("openai", "sk-test", server.URL, 1000)
+	client, err := NewClient("openai", "sk-test", server.URL, 1000, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestRateLimiter(t *testing.T) {
 }
 
 func TestUnsupportedProvider(t *testing.T) {
-	_, err := NewClient("invalid-provider", "key", "", 0)
+	_, err := NewClient("invalid-provider", "key", "", 0, 0)
 	if err == nil {
 		t.Error("expected error for unsupported provider")
 	}
@@ -224,7 +224,7 @@ func TestBackoffDelay(t *testing.T) {
 }
 
 func TestOllamaUsesOpenAIFormat(t *testing.T) {
-	client, err := NewClient("ollama", "", "", 0)
+	client, err := NewClient("ollama", "", "", 0, 0)
 	if err != nil {
 		t.Fatalf("NewClient ollama: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestChatCompletionStripsThinkTags(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient("openai", "sk-test", server.URL, 1000)
+	client, err := NewClient("openai", "sk-test", server.URL, 1000, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -78,7 +78,7 @@ func Query(projectDir string, question string, format string, topK int, opts ...
 	}
 
 	// Create LLM client
-	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit)
+	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit, cfg.API.TimeoutSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("query: create LLM client: %w", err)
 	}
@@ -318,7 +318,7 @@ func StreamQuery(ctx context.Context, projectDir string, question string, topK i
 		return nil, nil
 	}
 
-	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit)
+	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit, cfg.API.TimeoutSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("query: create LLM client: %w", err)
 	}

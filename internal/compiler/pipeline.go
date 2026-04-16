@@ -136,7 +136,7 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 	}
 
 	// Create LLM client
-	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit)
+	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit, cfg.API.TimeoutSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("compile: create LLM client: %w", err)
 	}
@@ -263,11 +263,16 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 	if visionEnabled && visionModelName != "" {
 		if visionAPIRef == "vision_api" && cfg.VisionAPI != nil && (cfg.VisionAPI.Provider != "" || cfg.VisionAPI.BaseURL != "" || cfg.VisionAPI.APIKey != "") {
 			// Use separate vision API
+			visionTimeout := cfg.VisionAPI.TimeoutSeconds
+			if visionTimeout <= 0 {
+				visionTimeout = cfg.API.TimeoutSeconds // fallback to main API timeout
+			}
 			vc, err := llm.NewVisionClient(
 				cfg.VisionAPI.Provider,
 				cfg.VisionAPI.APIKey,
 				cfg.VisionAPI.BaseURL,
 				cfg.API.RateLimit,
+				visionTimeout,
 			)
 			if err != nil {
 				log.Warn("failed to create vision client, falling back to main client", "error", err)

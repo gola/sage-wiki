@@ -67,7 +67,7 @@ func ReExtract(projectDir string) (*CompileResult, error) {
 	}
 
 	// Create LLM client
-	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit)
+	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit, cfg.API.TimeoutSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("re-extract: create LLM client: %w", err)
 	}
@@ -182,7 +182,7 @@ func ReWrite(projectDir string) (*CompileResult, error) {
 	log.Info("re-write: found concepts needing articles", "count", len(conceptsToWrite))
 
 	// Create LLM client
-	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit)
+	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit, cfg.API.TimeoutSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("re-write: create LLM client: %w", err)
 	}
